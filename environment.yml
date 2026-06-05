@@ -1,0 +1,14 @@
+name: kg-geometric
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - numpy
+  - scikit-learn
+  - pytorch
+  - cpuonly
+  - pip:
+      - torch-geometric
