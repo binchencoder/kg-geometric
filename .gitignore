@@ -218,3 +218,6 @@ build
 
 # Tmp
 /condaenv.*.requirements.txt
+
+/es_checkpoints
+/vocab_checkpoints
