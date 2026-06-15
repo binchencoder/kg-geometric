@@ -24,7 +24,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from sklearn.metrics import accuracy_score, classification_report
-from torch_geometric.data import Data
+from torch_geometric.data import Data, HeteroData
 from torch_geometric.nn import GCNConv
 
 
@@ -108,14 +108,26 @@ class FaultGCN(nn.Module):
         self.conv2 = GCNConv(hidden_dim, hidden_dim)
         self.classifier = nn.Linear(hidden_dim, 2)
 
-    def encode(self, data: Data) -> torch.Tensor:
-        x = self.conv1(data.x, data.edge_index)
+    @staticmethod
+    def _extract(data) -> Tuple[torch.Tensor, torch.Tensor]:
+        """兼容 Data 和 HeteroData 两种类型，提取 (x, edge_index)。"""
+        if isinstance(data, HeteroData):
+            x = data["entity"].x
+            edge_index = data["entity", "to", "entity"].edge_index
+        else:
+            x = data.x
+            edge_index = data.edge_index
+        return x, edge_index
+
+    def encode(self, data) -> torch.Tensor:
+        x, edge_index = self._extract(data)
+        x = self.conv1(x, edge_index)
         x = F.relu(x)
         x = F.dropout(x, p=0.2, training=self.training)
-        x = self.conv2(x, data.edge_index)
+        x = self.conv2(x, edge_index)
         return F.relu(x)
 
-    def forward(self, data: Data) -> torch.Tensor:
+    def forward(self, data) -> torch.Tensor:
         return self.classifier(self.encode(data))
 
 

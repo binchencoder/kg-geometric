@@ -7,19 +7,26 @@ Elasticsearch 知识图谱数据读取与三元组构建模块。
 3. 将三元组转换为模型训练所需的数据结构
 4. 批量读取与处理机制以应对工业级海量数据
 5. 异常处理确保数据完整性
+6. search_after 流式提取器（解决上亿数据深分页性能问题）
+7. 异步流式采样 + PyG NeighborLoader "边查边训" 流水线
 """
 
 from __future__ import annotations
 
+import json
 import logging
+import queue
+import threading
 from dataclasses import dataclass, field
-from typing import Dict, Iterator, List, Optional, Tuple
+from pathlib import Path
+from typing import Dict, Iterator, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
 from elasticsearch import Elasticsearch
 from elasticsearch.helpers import scan
-from torch_geometric.data import Data
+from torch_geometric.data import Data, HeteroData
+from torch_geometric.loader import NeighborLoader
 
 # -------------------- 日志配置 --------------------
 logging.basicConfig(
@@ -664,6 +671,908 @@ class TripleToDatasetConverter:
         }
 
 
+# ============================================================
+# 4. ES 流式三元组提取器（search_after 替代 scroll，解决上亿数据深分页问题）
+# ============================================================
+class ESTripletStreamer:
+    """使用 search_after 替代 scroll/scan，避免深分页性能灾难。
+
+    支持：
+    - 全量流式遍历（离线构建全局 ID 映射）
+    - 种子实体过滤子图（Mini-batch 训练）
+    - 断点续传
+    - 异步预取（生产者-消费者模式）
+
+    search_after 相比 scroll 的优势：
+    - 无状态分页，不占用 ES 服务端 scroll 上下文
+    - 深分页性能稳定，不会随 offset 增大而退化
+    - 天然支持断点续传
+    """
+
+    # 默认 ES 查询超时（秒），request_timeout 必须为 int/float
+    DEFAULT_TIMEOUT = 120
+    # 预取队列最大容量，防止内存溢出
+    MAX_QUEUE_SIZE = 4
+
+    def __init__(
+        self,
+        es_hosts: List[str],
+        index_name: Union[str, List[str]],
+        batch_size: int = 5000,
+        prefetch: bool = True,
+        checkpoint_dir: Optional[str] = None,
+    ):
+        """
+        Parameters
+        ----------
+        es_hosts : List[str]
+            ES 节点地址列表，如 ["http://host1:9200", "http://host2:9200"]。
+        index_name : str or List[str]
+            ES 索引名称，支持单个索引或索引列表（逗号分隔多索引查询）。
+        batch_size : int
+            每批返回的文档数。
+        prefetch : bool
+            是否启用异步预取（后台线程提前拉取下一批）。
+        checkpoint_dir : Optional[str]
+            断点续传目录，用于保存/恢复 progress。
+        """
+        self.es = Elasticsearch(es_hosts)
+        # 支持多索引：列表转逗号分隔字符串
+        if isinstance(index_name, list):
+            self.index = ",".join(index_name)
+            self._index_label = "_".join(sorted(index_name))
+        else:
+            self.index = index_name
+            self._index_label = index_name
+        self.batch_size = batch_size
+        self.prefetch = prefetch
+        self.checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir else None
+        if self.checkpoint_dir:
+            self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    # ---------- 断点续传 ----------
+    def _checkpoint_path(self) -> Path:
+        return self.checkpoint_dir / f"{self._index_label}_progress.json"
+
+    def _save_progress(self, search_after: Optional[List]) -> None:
+        if self.checkpoint_dir is None:
+            return
+        with open(self._checkpoint_path(), "w") as f:
+            json.dump({"search_after": search_after}, f)
+
+    def _load_progress(self) -> Optional[List]:
+        if self.checkpoint_dir is None:
+            return None
+        cp = self._checkpoint_path()
+        if not cp.exists():
+            return None
+        with open(cp) as f:
+            data = json.load(f)
+            return data.get("search_after")
+
+    def _clear_progress(self) -> None:
+        if self.checkpoint_dir is None:
+            return
+        cp = self._checkpoint_path()
+        if cp.exists():
+            cp.unlink()
+
+    # ---------- 核心：search_after 流式遍历 ----------
+    def _build_query(
+        self,
+        seed_entities: Optional[List[str]] = None,
+        head_field: str = "head_id",
+        tail_field: str = "tail_id",
+        extra_filters: Optional[dict] = None,
+    ) -> dict:
+        """构建带排序的 search_after 查询体。"""
+        if seed_entities:
+            query = {"terms": {head_field: seed_entities}}
+        elif extra_filters:
+            query = extra_filters
+        else:
+            query = {"match_all": {}}
+
+        return {
+            "query": query,
+            "sort": [
+                {head_field: "asc"},
+                {tail_field: "asc"},
+                {"_id": "asc"},  # tie-breaker: 保证全局唯一排序
+            ],
+            "size": self.batch_size,
+        }
+
+    def stream_triplets_raw(
+        self,
+        seed_entities: Optional[List[str]] = None,
+        head_field: str = "head_id",
+        relation_field: str = "relation",
+        tail_field: str = "tail_id",
+        resume: bool = True,
+        extra_filters: Optional[dict] = None,
+    ) -> Iterator[List[dict]]:
+        """流式生成原始三元组批次（dict 格式，不做 ID 映射）。
+
+        Yields
+        ------
+        List[dict]
+            每批三元组列表，每个三元组为 {"head": ..., "relation": ..., "tail": ...}。
+        """
+        query_body = self._build_query(
+            seed_entities=seed_entities,
+            head_field=head_field,
+            tail_field=tail_field,
+            extra_filters=extra_filters,
+        )
+
+        search_after = self._load_progress() if resume else None
+        if search_after:
+            logger.info(
+                "断点续传: 从 search_after=%s 继续遍历索引 %s",
+                search_after, self.index,
+            )
+
+        batch_count = 0
+        total_docs = 0
+        while True:
+            if search_after:
+                query_body["search_after"] = search_after
+
+            try:
+                resp = self.es.search(
+                    index=self.index,
+                    body=query_body,
+                    request_timeout=self.DEFAULT_TIMEOUT,
+                )
+            except Exception as e:
+                logger.error("ES search 失败 (batch=%d, search_after=%s): %s",
+                             batch_count, search_after, e)
+                raise
+
+            hits = resp["hits"]["hits"]
+            if not hits:
+                break
+
+            batch_count += 1
+            total_docs += len(hits)
+
+            # 提取三元组
+            triplets = []
+            for hit in hits:
+                src = hit["_source"]
+                h = src.get(head_field)
+                r = src.get(relation_field)
+                t = src.get(tail_field)
+                if h is not None and r is not None and t is not None:
+                    triplets.append({
+                        "head": str(h),
+                        "relation": str(r),
+                        "tail": str(t),
+                    })
+
+            yield triplets
+
+            # 更新游标
+            search_after = hits[-1]["sort"]
+            self._save_progress(search_after)
+
+            if len(hits) < self.batch_size:
+                break  # 最后一批
+
+        self._clear_progress()
+        logger.info("search_after 遍历完成: 共 %d 批, %d 条文档", batch_count, total_docs)
+
+    def stream_triplets(
+        self,
+        seed_entities: Optional[List[str]] = None,
+        head_field: str = "head_id",
+        relation_field: str = "relation",
+        tail_field: str = "tail_id",
+        resume: bool = True,
+        extra_filters: Optional[dict] = None,
+    ) -> Iterator[List[dict]]:
+        """带异步预取的流式三元组迭代器（生产者-消费者模式）。
+
+        生产者线程：从 ES search_after 拉取数据放入队列
+        消费者（主线程）：从队列取出数据进行训练
+
+        这使得 ES I/O 延迟被 GPU 计算完全掩盖，实现真正的"边查边训"。
+        """
+        if not self.prefetch:
+            yield from self.stream_triplets_raw(
+                seed_entities=seed_entities,
+                head_field=head_field,
+                relation_field=relation_field,
+                tail_field=tail_field,
+                resume=resume,
+                extra_filters=extra_filters,
+            )
+            return
+
+        # --- 异步预取模式 ---
+        data_queue: queue.Queue = queue.Queue(maxsize=self.MAX_QUEUE_SIZE)
+        stop_sentinel = object()
+        exception_holder: List[Exception] = []
+
+        def producer() -> None:
+            """生产者：在后台线程中从 ES 拉取数据。"""
+            try:
+                for batch in self.stream_triplets_raw(
+                    seed_entities=seed_entities,
+                    head_field=head_field,
+                    relation_field=relation_field,
+                    tail_field=tail_field,
+                    resume=resume,
+                    extra_filters=extra_filters,
+                ):
+                    data_queue.put(batch)  # 阻塞直到队列有空位
+                data_queue.put(stop_sentinel)
+            except Exception as e:
+                exception_holder.append(e)
+                data_queue.put(stop_sentinel)
+
+        thread = threading.Thread(target=producer, daemon=True, name="es-producer")
+        thread.start()
+
+        while True:
+            batch = data_queue.get()
+            if batch is stop_sentinel:
+                break
+            yield batch
+
+        thread.join(timeout=10)
+        if exception_holder:
+            raise exception_holder[0]
+
+
+# ============================================================
+# 5. 全局词汇表构建器（entity2idx / relation2idx）
+# ============================================================
+class KGVocabulary:
+    """管理实体和关系的全局 ID 映射。
+
+    支持增量构建和持久化，避免每次训练都重新扫描。
+    """
+
+    def __init__(self, checkpoint_dir: Optional[str] = None):
+        self.entity2idx: Dict[str, int] = {}
+        self.relation2idx: Dict[str, int] = {}
+        self.idx2entity: Dict[int, str] = {}
+        self.idx2relation: Dict[int, str] = {}
+        self.checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir else None
+
+    @property
+    def num_entities(self) -> int:
+        return len(self.entity2idx)
+
+    @property
+    def num_relations(self) -> int:
+        return len(self.relation2idx)
+
+    def add_entity(self, entity: str) -> int:
+        """添加实体，返回其索引。"""
+        if entity not in self.entity2idx:
+            idx = len(self.entity2idx)
+            self.entity2idx[entity] = idx
+            self.idx2entity[idx] = entity
+        return self.entity2idx[entity]
+
+    def add_relation(self, relation: str) -> int:
+        """添加关系类型，返回其索引。"""
+        if relation not in self.relation2idx:
+            idx = len(self.relation2idx)
+            self.relation2idx[relation] = idx
+            self.idx2relation[idx] = relation
+        return self.relation2idx[relation]
+
+    def build_from_streamer(
+        self,
+        streamer: ESTripletStreamer,
+        head_field: str = "head_id",
+        relation_field: str = "relation",
+        tail_field: str = "tail_id",
+        extra_filters: Optional[dict] = None,
+    ) -> int:
+        """从 ESTripletStreamer 流式构建词汇表。
+
+        Parameters
+        ----------
+        extra_filters : Optional[dict]
+            额外 ES 查询过滤条件，如 {"match": {"graphId": "xxx"}}。
+
+        Returns
+        -------
+        int
+            总三元组数。
+        """
+        total = 0
+        for batch in streamer.stream_triplets(
+            head_field=head_field,
+            relation_field=relation_field,
+            tail_field=tail_field,
+            extra_filters=extra_filters,
+        ):
+            for t in batch:
+                self.add_entity(t["head"])
+                self.add_entity(t["tail"])
+                self.add_relation(t["relation"])
+                total += 1
+
+            if total % 100000 == 0:
+                logger.info(
+                    "词汇表构建中... 实体: %d, 关系: %d, 三元组: %d",
+                    self.num_entities, self.num_relations, total,
+                )
+
+        logger.info(
+            "词汇表构建完成: 实体=%d, 关系=%d, 三元组=%d",
+            self.num_entities, self.num_relations, total,
+        )
+        return total
+
+    def save(self, filepath: str) -> None:
+        """持久化词汇表到磁盘。"""
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            "entity2idx": self.entity2idx,
+            "relation2idx": self.relation2idx,
+        }
+        with open(path, "w") as f:
+            json.dump(data, f, ensure_ascii=False)
+        logger.info("词汇表已保存至 %s", filepath)
+
+    @classmethod
+    def load(cls, filepath: str) -> "KGVocabulary":
+        """从磁盘加载词汇表。"""
+        with open(filepath) as f:
+            data = json.load(f)
+        vocab = cls()
+        vocab.entity2idx = data["entity2idx"]
+        vocab.relation2idx = data["relation2idx"]
+        vocab.idx2entity = {v: k for k, v in vocab.entity2idx.items()}
+        vocab.idx2relation = {v: k for k, v in vocab.relation2idx.items()}
+        logger.info(
+            "词汇表已加载: 实体=%d, 关系=%d",
+            vocab.num_entities, vocab.num_relations,
+        )
+        return vocab
+
+
+# ============================================================
+# 6. 异步子图采样器 —— 核心："边查边训"引擎
+# ============================================================
+class AsyncSubgraphSampler:
+    """基于 ES + search_after 的异步子图采样器。
+
+    结合 PyG NeighborLoader 的思路，但直接从 ES 动态构建子图，
+    无需将全图加载到内存，适合上亿级知识图谱。
+
+    工作流程：
+    1. 给定一批种子节点，异步查询 ES 获取它们的 k-hop 邻居边
+    2. 构建局部 HeteroData 子图
+    3. 通过预取队列实现 ES I/O 与 GPU 计算的流水线重叠
+    """
+
+    def __init__(
+        self,
+        streamer: ESTripletStreamer,
+        vocab: KGVocabulary,
+        num_hops: int = 2,
+        max_neighbors_per_hop: int = 100,
+        prefetch_size: int = 2,
+        head_field: str = "head_id",
+        relation_field: str = "relation",
+        tail_field: str = "tail_id",
+        embedding_dim: int = 64,
+    ):
+        """
+        Parameters
+        ----------
+        streamer : ESTripletStreamer
+            search_after 流式提取器。
+        vocab : KGVocabulary
+            全局实体/关系 ID 映射。
+        num_hops : int
+            邻居采样的跳数。
+        max_neighbors_per_hop : int
+            每跳最大邻居数（防止度数爆炸）。
+        prefetch_size : int
+            预取子图数量，越大 IO 隐藏越好但内存占用越高。
+        head_field / relation_field / tail_field : str
+            ES 索引中的字段名。
+        embedding_dim : int
+            实体特征嵌入维度（实际特征应从 ES 另一索引或外部特征源获取）。
+        """
+        self.streamer = streamer
+        self.vocab = vocab
+        self.num_hops = num_hops
+        self.max_neighbors_per_hop = max_neighbors_per_hop
+        self.prefetch_size = prefetch_size
+        self.head_field = head_field
+        self.relation_field = relation_field
+        self.tail_field = tail_field
+        self.embedding_dim = embedding_dim
+
+        # 预取队列与线程
+        self._prefetch_queue: queue.Queue = queue.Queue(maxsize=prefetch_size)
+        self._prefetch_thread: Optional[threading.Thread] = None
+        self._stop_prefetch = threading.Event()
+        self._prefetch_error: Optional[Exception] = None
+
+    def sample_subgraph(
+        self,
+        seed_entities: List[str],
+        num_hops: Optional[int] = None,
+    ) -> Optional[HeteroData]:
+        """从 ES 动态构建以 seed_entities 为中心的局部子图。
+
+        Parameters
+        ----------
+        seed_entities : List[str]
+            种子节点实体 ID 列表。
+        num_hops : Optional[int]
+            采样跳数，默认使用初始化参数。
+
+        Returns
+        -------
+        Optional[HeteroData]
+            构建的异质子图，若无边则返回 None。
+        """
+        hops = num_hops or self.num_hops
+        visited: Set[str] = set(seed_entities)
+        frontier: Set[str] = set(seed_entities)
+        edges: List[Tuple[int, int, int]] = []  # (head_idx, rel_idx, tail_idx)
+        local_entities: Dict[str, int] = {}  # 子图内实体 → 局部索引
+
+        for hop in range(hops):
+            if not frontier:
+                break
+
+            # 查询当前 frontier 的所有出边
+            frontier_list = list(frontier)
+            next_frontier: Set[str] = set()
+
+            # 分批查询（ES terms query 有长度限制）
+            chunk_size = 1000
+            for i in range(0, len(frontier_list), chunk_size):
+                chunk = frontier_list[i:i + chunk_size]
+
+                for batch in self.streamer.stream_triplets(
+                    seed_entities=chunk,
+                    head_field=self.head_field,
+                    relation_field=self.relation_field,
+                    tail_field=self.tail_field,
+                    resume=False,  # 子图查询不续传
+                ):
+                    for t in batch:
+                        h, r, tail = t["head"], t["relation"], t["tail"]
+
+                        # 分配局部索引
+                        if h not in local_entities:
+                            local_entities[h] = len(local_entities)
+                        if tail not in local_entities:
+                            local_entities[tail] = len(local_entities)
+
+                        # 确保关系在全局词汇表中
+                        global_rel_idx = self.vocab.add_relation(r)
+
+                        edges.append((
+                            local_entities[h],
+                            global_rel_idx,
+                            local_entities[tail],
+                        ))
+
+                        # 下一跳：尾实体（如果尚未访问且未超限）
+                        if tail not in visited and len(next_frontier) < self.max_neighbors_per_hop:
+                            next_frontier.add(tail)
+                            visited.add(tail)
+
+            frontier = next_frontier
+
+        if not edges:
+            return None
+
+        # 构建 HeteroData
+        data = HeteroData()
+        data["entity"].num_nodes = len(local_entities)
+        data["entity"].x = torch.randn(len(local_entities), self.embedding_dim)
+
+        edge_array = np.array(edges, dtype=np.int64)
+        data["entity", "to", "entity"].edge_index = torch.tensor(
+            [edge_array[:, 0], edge_array[:, 2]], dtype=torch.long
+        )
+        data["entity", "to", "entity"].edge_type = torch.tensor(
+            edge_array[:, 1], dtype=torch.long
+        )
+
+        # 附加元数据
+        data.local_entity_ids = list(local_entities.keys())
+        data.local2global = torch.tensor(
+            [self.vocab.entity2idx.get(e, -1) for e in data.local_entity_ids],
+            dtype=torch.long,
+        )
+
+        return data
+
+    # ---------- 异步预取流水线 ----------
+    def _prefetch_worker(
+        self,
+        seed_batches: Iterator[List[str]],
+    ) -> None:
+        """后台预取线程：持续从 ES 拉取子图并放入队列。"""
+        try:
+            for seeds in seed_batches:
+                if self._stop_prefetch.is_set():
+                    break
+                subgraph = self.sample_subgraph(seeds)
+                self._prefetch_queue.put((seeds, subgraph))
+            self._prefetch_queue.put(None)  # 结束信号
+        except Exception as e:
+            self._prefetch_error = e
+            self._prefetch_queue.put(None)
+
+    def iter_subgraphs(
+        self,
+        seed_batches: List[List[str]],
+    ) -> Iterator[Tuple[List[str], Optional[HeteroData]]]:
+        """同步迭代器：逐个返回 (种子节点, 子图)。
+
+        Parameters
+        ----------
+        seed_batches : List[List[str]]
+            种子节点批次的列表。
+        """
+        for seeds in seed_batches:
+            yield seeds, self.sample_subgraph(seeds)
+
+    def iter_subgraphs_async(
+        self,
+        seed_batches: List[List[str]],
+    ) -> Iterator[Tuple[List[str], Optional[HeteroData]]]:
+        """异步预取迭代器：后台拉取 + 主线程消费。
+
+        ES 查询与 GPU 训练流水线重叠，实现"边查边训"。
+        """
+        if self.prefetch_size <= 0:
+            yield from self.iter_subgraphs(seed_batches)
+            return
+
+        self._stop_prefetch.clear()
+        self._prefetch_error = None
+
+        # 清空队列
+        while not self._prefetch_queue.empty():
+            try:
+                self._prefetch_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        # 启动预取线程
+        self._prefetch_thread = threading.Thread(
+            target=self._prefetch_worker,
+            args=(iter(seed_batches),),
+            daemon=True,
+            name="es-subgraph-prefetch",
+        )
+        self._prefetch_thread.start()
+
+        # 主线程消费
+        received = 0
+        while True:
+            item = self._prefetch_queue.get()
+            if item is None:
+                break
+            received += 1
+            yield item
+
+        self._prefetch_thread.join(timeout=30)
+        if self._prefetch_error:
+            raise self._prefetch_error
+
+        logger.info("异步子图采样完成: 预取了 %d/%d 个子图", received, len(seed_batches))
+
+    def shutdown(self) -> None:
+        """关闭预取线程。"""
+        self._stop_prefetch.set()
+        if self._prefetch_thread and self._prefetch_thread.is_alive():
+            self._prefetch_thread.join(timeout=10)
+
+
+# ============================================================
+# 7. PyG NeighborLoader 适配器（全图在内存时使用）
+# ============================================================
+class KGNeighborLoaderAdapter:
+    """将 ES 流式构建的全图适配为 PyG NeighborLoader。
+
+    适用场景：知识图谱足够小（边数 < 数千万），可以全量加载到内存。
+    此时利用 NeighborLoader 的高效采样，配合 CUDA 加速训练。
+
+    使用流程：
+    1. 用 ESTripletStreamer 全量遍历构建全局图
+    2. 用本适配器创建 NeighborLoader
+    3. 标准 PyG 训练循环
+    """
+
+    def __init__(
+        self,
+        vocab: KGVocabulary,
+        edge_index: torch.Tensor,
+        edge_type: Optional[torch.Tensor] = None,
+        node_features: Optional[torch.Tensor] = None,
+        embedding_dim: int = 64,
+    ):
+        """
+        Parameters
+        ----------
+        vocab : KGVocabulary
+            全局词汇表。
+        edge_index : torch.Tensor
+            边索引 [2, num_edges]。
+        edge_type : Optional[torch.Tensor]
+            边类型索引 [num_edges]。
+        node_features : Optional[torch.Tensor]
+            节点特征，若为 None 则使用随机初始化的可学习嵌入。
+        embedding_dim : int
+            当 node_features 为 None 时的嵌入维度。
+        """
+        self.vocab = vocab
+        self.embedding_dim = embedding_dim
+
+        self.data = HeteroData()
+        self.data["entity"].num_nodes = vocab.num_entities
+
+        if node_features is not None:
+            self.data["entity"].x = node_features
+        else:
+            self.data["entity"].x = torch.randn(vocab.num_entities, embedding_dim)
+
+        self.data["entity", "to", "entity"].edge_index = edge_index
+        if edge_type is not None:
+            self.data["entity", "to", "entity"].edge_type = edge_type
+
+    def create_loader(
+        self,
+        input_nodes: torch.Tensor,
+        num_neighbors: List[int] = None,
+        batch_size: int = 128,
+        shuffle: bool = True,
+        **kwargs,
+    ) -> NeighborLoader:
+        """创建 PyG NeighborLoader。
+
+        Parameters
+        ----------
+        input_nodes : torch.Tensor
+            训练节点索引。
+        num_neighbors : List[int]
+            每跳采样邻居数，如 [25, 10] 表示第一跳采样25个，第二跳10个。
+        batch_size : int
+            每批节点数。
+        shuffle : bool
+            是否打乱。
+        """
+        if num_neighbors is None:
+            num_neighbors = [25, 10]
+
+        return NeighborLoader(
+            self.data,
+            num_neighbors=num_neighbors,
+            batch_size=batch_size,
+            input_nodes=("entity", input_nodes),
+            shuffle=shuffle,
+            **kwargs,
+        )
+
+    @classmethod
+    def from_streamer(
+        cls,
+        streamer: ESTripletStreamer,
+        vocab: Optional[KGVocabulary] = None,
+        head_field: str = "head_id",
+        relation_field: str = "relation",
+        tail_field: str = "tail_id",
+        embedding_dim: int = 64,
+        node_features: Optional[torch.Tensor] = None,
+    ) -> "KGNeighborLoaderAdapter":
+        """从 ESTripletStreamer 一键构建全图 + NeighborLoader 适配器。
+
+        内部会做一次全量遍历来构建 edge_index。
+        """
+        if vocab is None:
+            vocab = KGVocabulary()
+
+        edges: List[Tuple[int, int]] = []
+        edge_types: List[int] = []
+        total = 0
+
+        for batch in streamer.stream_triplets(
+            head_field=head_field,
+            relation_field=relation_field,
+            tail_field=tail_field,
+        ):
+            for t in batch:
+                h_idx = vocab.add_entity(t["head"])
+                t_idx = vocab.add_entity(t["tail"])
+                r_idx = vocab.add_relation(t["relation"])
+                edges.append((h_idx, t_idx))
+                edge_types.append(r_idx)
+                total += 1
+
+            if total % 500000 == 0:
+                logger.info(
+                    "全图构建中... 实体: %d, 边: %d",
+                    vocab.num_entities, total,
+                )
+
+        if not edges:
+            raise ValueError("未从 ES 读取到任何三元组")
+
+        edge_array = np.array(edges, dtype=np.int64)
+        edge_index = torch.tensor(edge_array.T, dtype=torch.long)
+        edge_type = torch.tensor(edge_types, dtype=torch.long)
+
+        logger.info(
+            "全图构建完成: 实体=%d, 关系=%d, 边=%d",
+            vocab.num_entities, vocab.num_relations, total,
+        )
+
+        return cls(
+            vocab=vocab,
+            edge_index=edge_index,
+            edge_type=edge_type,
+            node_features=node_features,
+            embedding_dim=embedding_dim,
+        )
+
+
+# ============================================================
+# 8. "边查边训" 训练流水线
+# ============================================================
+class StreamingTrainingPipeline:
+    """将异步 ES 子图采样与 PyG 训练循环集成的流水线。
+
+    两种模式：
+    1. 全图模式（图小）：先全量构建 graph → NeighborLoader → 训练
+    2. 流式模式（图大）：AsyncSubgraphSampler 动态采样 → 训练
+
+    模式 2 真正实现"边查边训"：ES 查询与 GPU 前向/反向传播流水线重叠。
+    """
+
+    def __init__(
+        self,
+        streamer: ESTripletStreamer,
+        vocab: Optional[KGVocabulary] = None,
+        mode: str = "streaming",
+        **sampler_kwargs,
+    ):
+        """
+        Parameters
+        ----------
+        streamer : ESTripletStreamer
+            search_after 流式提取器。
+        vocab : Optional[KGVocabulary]
+            词汇表，None 则自动构建。
+        mode : str
+            "full" 或 "streaming"。
+        **sampler_kwargs
+            传递给 AsyncSubgraphSampler 的参数。
+        """
+        self.streamer = streamer
+        self.mode = mode
+        self.vocab = vocab or KGVocabulary()
+        self.sampler_kwargs = sampler_kwargs
+
+        self._sampler: Optional[AsyncSubgraphSampler] = None
+        self._loader_adapter: Optional[KGNeighborLoaderAdapter] = None
+
+    def build_vocab(
+        self,
+        head_field: str = "head_id",
+        relation_field: str = "relation",
+        tail_field: str = "tail_id",
+    ) -> KGVocabulary:
+        """第一阶段：构建全局词汇表（只需一次）。"""
+        self.vocab.build_from_streamer(
+            streamer=self.streamer,
+            head_field=head_field,
+            relation_field=relation_field,
+            tail_field=tail_field,
+        )
+        return self.vocab
+
+    def prepare(
+        self,
+        seed_batches: Optional[List[List[str]]] = None,
+        input_nodes: Optional[torch.Tensor] = None,
+        head_field: str = "head_id",
+        relation_field: str = "relation",
+        tail_field: str = "tail_id",
+    ) -> Iterator:
+        """准备训练数据迭代器。
+
+        根据 mode 返回不同迭代器：
+        - "full": NeighborLoader 迭代器
+        - "streaming": AsyncSubgraphSampler 异步迭代器
+
+        Returns
+        -------
+        Iterator
+            每次迭代返回一个 mini-batch 用于训练。
+        """
+        if self.mode == "full":
+            return self._prepare_full_mode(
+                input_nodes=input_nodes,
+                head_field=head_field,
+                relation_field=relation_field,
+                tail_field=tail_field,
+            )
+        else:
+            return self._prepare_streaming_mode(
+                seed_batches=seed_batches,
+                head_field=head_field,
+                relation_field=relation_field,
+                tail_field=tail_field,
+            )
+
+    def _prepare_full_mode(
+        self,
+        input_nodes: Optional[torch.Tensor],
+        head_field: str,
+        relation_field: str,
+        tail_field: str,
+    ) -> NeighborLoader:
+        """全图模式：构建完整图 + NeighborLoader。"""
+        logger.info("全图模式: 开始构建全局图...")
+        self._loader_adapter = KGNeighborLoaderAdapter.from_streamer(
+            streamer=self.streamer,
+            vocab=self.vocab,
+            head_field=head_field,
+            relation_field=relation_field,
+            tail_field=tail_field,
+        )
+
+        if input_nodes is None:
+            input_nodes = torch.arange(self.vocab.num_entities, dtype=torch.long)
+
+        loader = self._loader_adapter.create_loader(
+            input_nodes=input_nodes,
+            num_neighbors=[25, 10],
+            batch_size=128,
+        )
+        logger.info("全图模式: NeighborLoader 就绪")
+        return loader
+
+    def _prepare_streaming_mode(
+        self,
+        seed_batches: Optional[List[List[str]]],
+        head_field: str,
+        relation_field: str,
+        tail_field: str,
+    ) -> AsyncSubgraphSampler:
+        """流式模式：创建异步子图采样器。"""
+        if seed_batches is None:
+            raise ValueError("流式模式需要提供 seed_batches (种子节点批次列表)")
+
+        logger.info("流式模式: 初始化异步子图采样器...")
+        self._sampler = AsyncSubgraphSampler(
+            streamer=self.streamer,
+            vocab=self.vocab,
+            head_field=head_field,
+            relation_field=relation_field,
+            tail_field=tail_field,
+            **self.sampler_kwargs,
+        )
+        logger.info("流式模式: 异步子图采样器就绪 (num_hops=%d)", self._sampler.num_hops)
+        return self._sampler
+
+    def shutdown(self) -> None:
+        """清理资源。"""
+        if self._sampler:
+            self._sampler.shutdown()
+
+
 # -------------------- 便捷函数 --------------------
 def build_pipeline(
         entity_index: str = "knowledge_entity_index",
@@ -702,59 +1611,199 @@ def build_pipeline(
 
 # -------------------- 示例主程序 --------------------
 def main() -> None:
-    """示例：连接 ES，读取数据，构建训练数据集。"""
-    # ---------- 1. 连接 ES ----------
-    reader = ESKnowledgeGraphReader()
+    """示例：支持 3 种模式的知识图谱读取与训练。
 
-    try:
-        # ---------- 2. 发现可用索引 ----------
-        logger.info("发现索引: %s", reader.list_indices())
+    模式 A: 传统 scroll/scan 模式（兼容旧代码）
+    模式 B: search_after 全图模式 → NeighborLoader 训练（图较小，内存可容纳）
+    模式 C: search_after 流式模式 → 异步子图采样训练（图巨大，"边查边训"）
+    """
+    import argparse
 
-        # ---------- 3. 读取三元组 ----------
-        # 场景 A：实体+关系+关系类型三索引模式（完整链路）
-        # fetch_triples 内部自动执行两步查询：
-        #   ① relation_field(id) → knowledge_entity_type_relation_index.relationTypeId → name
-        #   ② srcEntityId/dstEntityId → knowledge_entity_index.entityId → name
-        triples = reader.fetch_triples(
-            entity_index="knowledge_entity_index",
-            relation_index="knowledge_entity_relation_index",
-            relation_type_index="knowledge_entity_type_relation_index",
-            batch_size=5000,
+    parser = argparse.ArgumentParser(description="ES 知识图谱读取与训练")
+    parser.add_argument(
+        "--mode", choices=["legacy", "full", "streaming"], default="streaming",
+        help="legacy: 传统scroll模式 | full: NeighborLoader全图模式 | streaming: 异步流式边查边训",
+    )
+    parser.add_argument(
+        "--index", default=["knowledge_entity_relation_index"], nargs="+",
+        help="ES 索引名（支持多个）",
+    )
+    parser.add_argument("--batch-size", type=int, default=5000)
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--prefetch", type=int, default=2, help="异步预取队列大小")
+    # ES 字段映射（对齐原代码的索引 schema）
+    parser.add_argument("--head-field", default="srcEntityId")
+    parser.add_argument("--relation-field", default="relationTypeId")
+    parser.add_argument("--tail-field", default="dstEntityId")
+    parser.add_argument("--graph-id", default=None, help="按 graphId 过滤（如 980044155496734720）")
+    args = parser.parse_args()
+
+    config = ESConfig()
+
+    # ========== 模式 A: 传统模式（兼容旧代码） ==========
+    if args.mode == "legacy":
+        reader = ESKnowledgeGraphReader(config)
+        try:
+            logger.info("运行模式: legacy (scroll/scan)")
+            logger.info("发现索引: %s", reader.list_indices())
+
+            triples = reader.fetch_triples(
+                entity_index="knowledge_entity_index",
+                relation_index="knowledge_entity_relation_index",
+                relation_type_index="knowledge_entity_type_relation_index",
+                batch_size=args.batch_size,
+            )
+
+            if not triples:
+                logger.error("未提取到三元组")
+                return
+
+            logger.info("共提取 %d 个三元组，预览前 5 条:", len(triples))
+            for t in triples[:5]:
+                logger.info("  (%s) --[%s]--> (%s)", t.head, t.relation, t.tail)
+
+            converter = TripleToDatasetConverter(triples)
+            data = converter.to_data()
+
+            from kg_fault_diagnosis import FaultGCN, split_masks, train, evaluate
+            data.train_mask, data.val_mask, data.test_mask = split_masks(data.num_nodes)
+            model = FaultGCN(in_dim=data.num_features, hidden_dim=32)
+            train(model, data)
+            evaluate(model, data)
+        finally:
+            reader.close()
+        return
+
+    # ========== 模式 B & C: search_after 流式架构 ==========
+    # 多索引支持：传入列表即可跨索引查询
+    index_names = args.index if len(args.index) > 1 else args.index[0]
+    logger.info("目标索引: %s", index_names)
+
+    streamer = ESTripletStreamer(
+        es_hosts=[f"{config.scheme}://{config.host}:{config.port}"],
+        index_name=index_names,
+        batch_size=args.batch_size,
+        prefetch=True,
+        checkpoint_dir="./es_checkpoints",
+    )
+
+    # ---------- 第一阶段：构建全局词汇表 ----------
+    logger.info("Phase 1: 构建全局实体/关系词汇表...")
+    vocab = KGVocabulary(checkpoint_dir="./vocab_checkpoints")
+
+    # 构建 graphId 过滤条件（对齐原代码默认行为）
+    extra_filters = None
+    if args.graph_id:
+        extra_filters = {"match": {"graphId": args.graph_id}}
+        logger.info("启用 graphId 过滤: %s", args.graph_id)
+
+    vocab.build_from_streamer(
+        streamer,
+        head_field=args.head_field,
+        relation_field=args.relation_field,
+        tail_field=args.tail_field,
+        extra_filters=extra_filters,
+    )
+    vocab.save("./vocab_checkpoints/vocab.json")
+
+    if args.mode == "full":
+        # ========== 模式 B: 全图 NeighborLoader ==========
+        logger.info("模式 B: 全图模式 → 构建 edge_index + NeighborLoader")
+        adapter = KGNeighborLoaderAdapter.from_streamer(
+            streamer=streamer,
+            vocab=vocab,
+            head_field=args.head_field,
+            relation_field=args.relation_field,
+            tail_field=args.tail_field,
         )
 
-        # 场景 B（备选）：单索引+关系类型映射模式
-        # triples = reader.fetch_triples_from_single_index(
-        #     index="knowledge_entity_relation_index",
-        #     relation_type_index="knowledge_entity_type_relation_index",
-        # )
+        # 创建 NeighborLoader
+        all_nodes = torch.arange(vocab.num_entities, dtype=torch.long)
+        loader = adapter.create_loader(
+            input_nodes=all_nodes,
+            num_neighbors=[25, 10],
+            batch_size=128,
+            shuffle=True,
+        )
 
-        if not triples:
-            logger.error("未提取到三元组，请确认索引名称和字段映射是否正确。")
-            logger.info("使用 list_indices() 查看可用索引，使用 get_index_mapping() 查看字段结构。")
-            return
+        # 标准 PyG 训练循环
+        from kg_fault_diagnosis import FaultGCN
+        from sklearn.metrics import accuracy_score
 
-        # ---------- 4. 预览三元组 ----------
-        logger.info("共提取 %d 个三元组，预览前 10 条:", len(triples))
-        for t in triples[:10]:
-            logger.info("  (%s) --[%s]--> (%s)", t.head, t.relation, t.tail)
+        model = FaultGCN(in_dim=64, hidden_dim=32)
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
 
-        # ---------- 5. 转换为训练数据集 ----------
-        converter = TripleToDatasetConverter(triples)
-        data = converter.to_data()
+        logger.info("开始训练 (NeighborLoader 模式)...")
+        for epoch in range(args.epochs):
+            model.train()
+            total_loss = 0.0
+            for batch in loader:
+                optimizer.zero_grad()
+                logits = model(batch)
+                loss = torch.nn.functional.cross_entropy(
+                    logits, torch.zeros(batch["entity"].num_nodes, dtype=torch.long)
+                )
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item()
+            logger.info("Epoch %d | loss=%.4f", epoch, total_loss)
 
-        logger.info("模型训练数据准备完毕:")
-        for k, v in converter.statistics().items():
-            logger.info("  %s: %s", k, v)
+    else:
+        # ========== 模式 C: 流式"边查边训" ==========
+        logger.info("模式 C: 流式模式 → 异步子图采样 + 边查边训")
 
-        # 可以直接传递给 kg_fault_diagnosis.py 中的 FaultGCN:
-        from kg_fault_diagnosis import FaultGCN, split_masks, train, evaluate
-        data.train_mask, data.val_mask, data.test_mask = split_masks(data.num_nodes)
-        model = FaultGCN(in_dim=data.num_features, hidden_dim=32)
-        train(model, data)
-        evaluate(model, data)
+        sampler = AsyncSubgraphSampler(
+            streamer=streamer,
+            vocab=vocab,
+            num_hops=2,
+            max_neighbors_per_hop=100,
+            prefetch_size=args.prefetch,
+            head_field=args.head_field,
+            relation_field=args.relation_field,
+            tail_field=args.tail_field,
+        )
 
-    finally:
-        reader.close()
+        # 模拟种子节点批次（实际场景中由业务 Sampler 产生）
+        sample_entities = list(vocab.entity2idx.keys())[:200]
+        seed_batches = [
+            sample_entities[i:i + 32]
+            for i in range(0, len(sample_entities), 32)
+        ]
+
+        from kg_fault_diagnosis import FaultGCN
+
+        model = FaultGCN(in_dim=64, hidden_dim=32)
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+
+        logger.info("开始训练 (流式 边查边训 模式)...")
+        for epoch in range(args.epochs):
+            model.train()
+            batch_count = 0
+
+            for seeds, subgraph in sampler.iter_subgraphs_async(seed_batches):
+                if subgraph is None:
+                    continue
+
+                batch_count += 1
+                optimizer.zero_grad()
+                logits = model(subgraph)
+                loss = torch.nn.functional.cross_entropy(
+                    logits,
+                    torch.zeros(subgraph["entity"].num_nodes, dtype=torch.long),
+                )
+                loss.backward()
+                optimizer.step()
+
+            logger.info(
+                "Epoch %d | batches=%d | entities=%d | relations=%d",
+                epoch,
+                batch_count,
+                vocab.num_entities,
+                vocab.num_relations,
+            )
+
+        sampler.shutdown()
+        logger.info("流式训练完成")
 
 
 if __name__ == "__main__":
