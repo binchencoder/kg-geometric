@@ -23,6 +23,8 @@ from typing import Dict, Iterator, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from elasticsearch import Elasticsearch
 from elasticsearch.helpers import scan
 from torch_geometric.data import Data, HeteroData
@@ -672,7 +674,424 @@ class TripleToDatasetConverter:
 
 
 # ============================================================
-# 4. ES 流式三元组提取器（search_after 替代 scroll，解决上亿数据深分页问题）
+# 4. ID-名称解析器 —— 将 ES 中的原始 ID 映射为人类可读名称
+# ============================================================
+class IDNameResolver:
+    """从 ES 实体/关系类型索引构建 ID→名称映射，用于三元组 ID 解析。
+
+    对齐原 ESKnowledgeGraphReader 的三步查询逻辑（第 1-2 步）：
+    1. 扫描 entity_index → 构建 entityId → entityName 映射
+    2. 扫描 relation_type_index → 构建 relationTypeId → relationName 映射
+
+    这两个索引通常较小，使用 scroll/scan 即可，无需 search_after。
+    """
+
+    def __init__(self, es: Elasticsearch):
+        self.es = es
+        self.entity_map: Dict[str, str] = {}  # entityId → name
+        self.relation_type_map: Dict[str, str] = {}  # relationTypeId → name
+        self.entity_name_to_id: Dict[str, str] = {}  # name → entityId (反向映射，供采样器查询 ES)
+        self.relation_name_to_id: Dict[str, str] = {}  # name → relationTypeId (反向映射)
+
+    def _index_exists(self, index: str) -> bool:
+        try:
+            return self.es.indices.exists(index=index)
+        except Exception:
+            return False
+
+    def _scan_index(
+            self,
+            index: str,
+            query: dict,
+            batch_size: int = 5000,
+    ) -> Iterator[dict]:
+        """流式扫描索引（scroll 方式，适合小索引）。"""
+        if not self._index_exists(index):
+            raise RuntimeError(
+                f"索引 '{index}' 不存在，请确认索引名称。"
+            )
+
+        yield from scan(
+            client=self.es,
+            index=index,
+            query={"query": query},
+            size=batch_size,
+            scroll="10m",
+            preserve_order=False,
+        )
+
+    def _sample_index_docs(self, index: str, size: int = 3) -> list:
+        """采样索引中的前几篇文档，用于诊断字段名/数据格式。"""
+        try:
+            resp = self.es.search(
+                index=index,
+                body={"query": {"match_all": {}}, "size": size},
+                request_timeout=10,
+            )
+            return [hit["_source"] for hit in resp["hits"]["hits"]]
+        except Exception as e:
+            logger.warning("采样索引 '%s' 失败: %s", index, e)
+            return []
+
+    @staticmethod
+    def _safe_get(source: dict, field: str, default: str = "") -> str:
+        """安全取值，支持嵌套字段。"""
+        if field in source:
+            val = source[field]
+            return str(val).strip() if val is not None else default
+        parts = field.split(".")
+        current = source
+        for part in parts:
+            if isinstance(current, dict) and part in current:
+                current = current[part]
+            else:
+                return default
+        return str(current).strip() if current is not None else default
+
+    def _populate_map_from_scan(
+            self,
+            index: str,
+            query: dict,
+            id_field: str,
+            name_field: str,
+            target_map: Dict[str, str],
+            reverse_map: Optional[Dict[str, str]] = None,
+            batch_size: int = 5000,
+    ) -> int:
+        """从扫描结果中填充 ID→名称映射。"""
+        count = 0
+        for doc in self._scan_index(
+                index=index,
+                query=query,
+                batch_size=batch_size,
+        ):
+            try:
+                source = doc.get("_source", doc)
+                eid = self._safe_get(source, id_field)
+                name = self._safe_get(source, name_field)
+                if eid and name:
+                    target_map[eid] = name
+                    if reverse_map is not None:
+                        reverse_map[name] = eid
+                    count += 1
+            except Exception as e:
+                logger.warning("解析文档 %s 失败: %s", doc.get("_id", "?"), e)
+        return count
+
+    def _diagnose_empty_map(
+            self,
+            index: str,
+            id_field: str,
+            name_field: str,
+            filter_key: str,
+            filter_value: str,
+    ) -> None:
+        """当映射为空时，采样索引文档以帮助诊断问题。"""
+        samples = self._sample_index_docs(index, size=3)
+        if samples:
+            logger.warning(
+                "⚠️  映射为空！采样索引 '%s' 的文档:\n"
+                "  过滤条件: %s=%s\n"
+                "  期望字段: id=%s, name=%s\n"
+                "  实际文档字段: %s",
+                index, filter_key, filter_value,
+                id_field, name_field,
+                list(samples[0].keys()) if samples else "N/A",
+            )
+            for i, doc in enumerate(samples):
+                logger.warning(
+                    "  样本%d: %s",
+                    i + 1,
+                    {k: str(v)[:80] for k, v in doc.items()},
+                )
+        else:
+            logger.warning(
+                "⚠️  映射为空且无法采样！索引 '%s' 可能为空或不可访问。",
+                index,
+            )
+
+    def build_entity_map(
+            self,
+            entity_index: str = "knowledge_entity_index",
+            graph_id: Optional[str] = "980044155496734720",
+            id_field: str = "entityId",
+            name_field: str = "name",
+            batch_size: int = 5000,
+            extra_query: Optional[dict] = None,
+            debug: bool = False,
+    ) -> int:
+        """扫描实体索引，构建 entityId → name 映射。
+
+        Returns
+        -------
+        int
+            加载的实体数量。
+        """
+        self.entity_map.clear()
+        self.entity_name_to_id.clear()
+
+        if extra_query:
+            query = extra_query
+        elif graph_id:
+            query = {"match": {"graphId": graph_id}}
+        else:
+            query = {"match_all": {}}
+
+        count = self._populate_map_from_scan(
+            index=entity_index,
+            query=query,
+            id_field=id_field,
+            name_field=name_field,
+            target_map=self.entity_map,
+            reverse_map=self.entity_name_to_id,
+            batch_size=batch_size,
+        )
+
+        logger.info("从索引 %s 读取了 %d 个实体 (ID↔名称, id_field=%s, name_field=%s)",
+                    entity_index, count, id_field, name_field)
+
+        # ---------- 空结果诊断与自动 fallback ----------
+        if count == 0:
+            self._diagnose_empty_map(
+                entity_index, id_field, name_field,
+                "graphId", str(graph_id or "N/A"),
+            )
+            # 如果用了 graph_id 过滤但结果为空，尝试 match_all 并警告
+            has_filter = bool(extra_query) or bool(graph_id)
+            if has_filter:
+                logger.warning(
+                    "⚠️  实体映射在 graph_id 过滤下为空，尝试全量扫描 (match_all) ..."
+                )
+                count = self._populate_map_from_scan(
+                    index=entity_index,
+                    query={"match_all": {}},
+                    id_field=id_field,
+                    name_field=name_field,
+                    target_map=self.entity_map,
+                    reverse_map=self.entity_name_to_id,
+                    batch_size=batch_size,
+                )
+                if count > 0:
+                    logger.warning(
+                        "⚠️  全量扫描成功：读取了 %d 个实体。"
+                        "请确认 --graph-id 参数是否正确（当前: %s）。"
+                        "实体的 graphId 字段值可能与索引中不一致。",
+                        count, graph_id,
+                    )
+                else:
+                    logger.warning(
+                        "⚠️  全量扫描仍然为空！"
+                        "请使用 --resolve-debug 查看索引文档详情，"
+                        "或通过 --entity-id-field / --entity-name-field 指定正确字段名。",
+                    )
+
+        if debug:
+            samples = self._sample_index_docs(entity_index, size=3)
+            logger.info(
+                "[DEBUG] 实体索引 '%s' 样本文档字段: %s",
+                entity_index,
+                [list(d.keys()) for d in samples],
+            )
+
+        return count
+
+    def build_relation_type_map(
+            self,
+            relation_type_index: str = "knowledge_entity_type_relation_index",
+            ontology_id: Optional[str] = "979748419706068992",
+            id_field: str = "relationTypeId",
+            name_field: str = "name",
+            batch_size: int = 5000,
+            extra_query: Optional[dict] = None,
+            debug: bool = False,
+    ) -> int:
+        """扫描关系类型索引，构建 relationTypeId → name 映射。
+
+        Returns
+        -------
+        int
+            加载的关系类型数量。
+        """
+        self.relation_type_map.clear()
+        self.relation_name_to_id.clear()
+
+        if extra_query:
+            query = extra_query
+        elif ontology_id:
+            query = {"match": {"ontologyId": ontology_id}}
+        else:
+            query = {"match_all": {}}
+
+        count = self._populate_map_from_scan(
+            index=relation_type_index,
+            query=query,
+            id_field=id_field,
+            name_field=name_field,
+            target_map=self.relation_type_map,
+            reverse_map=self.relation_name_to_id,
+            batch_size=batch_size,
+        )
+
+        logger.info(
+            "从索引 %s 读取了 %d 种关系类型 (ID↔名称, id_field=%s, name_field=%s)",
+            relation_type_index, count, id_field, name_field,
+        )
+
+        # ---------- 空结果诊断与自动 fallback ----------
+        if count == 0:
+            self._diagnose_empty_map(
+                relation_type_index, id_field, name_field,
+                "ontologyId", str(ontology_id or "N/A"),
+            )
+            has_filter = bool(extra_query) or bool(ontology_id)
+            if has_filter:
+                logger.warning(
+                    "⚠️  关系类型映射在 ontology_id 过滤下为空，尝试全量扫描 (match_all) ..."
+                )
+                count = self._populate_map_from_scan(
+                    index=relation_type_index,
+                    query={"match_all": {}},
+                    id_field=id_field,
+                    name_field=name_field,
+                    target_map=self.relation_type_map,
+                    reverse_map=self.relation_name_to_id,
+                    batch_size=batch_size,
+                )
+                if count > 0:
+                    logger.warning(
+                        "⚠️  全量扫描成功：读取了 %d 种关系类型。"
+                        "请确认 --ontology-id 参数是否正确（当前: %s）。"
+                        "关系类型的 ontologyId 字段值可能与索引中不一致。",
+                        count, ontology_id,
+                    )
+                else:
+                    logger.warning(
+                        "⚠️  全量扫描仍然为空！"
+                        "请使用 --resolve-debug 查看索引文档详情，"
+                        "或通过 --relation-type-id-field / --relation-type-name-field 指定正确字段名。",
+                    )
+
+        if debug:
+            samples = self._sample_index_docs(relation_type_index, size=3)
+            logger.info(
+                "[DEBUG] 关系类型索引 '%s' 样本文档字段: %s",
+                relation_type_index,
+                [list(d.keys()) for d in samples],
+            )
+
+        return count
+
+    def resolve_entity_names_to_ids(
+            self,
+            names: List[str],
+    ) -> List[str]:
+        """将实体名称反向解析为 ES 中的原始 entityId。
+
+        用于 AsyncSubgraphSampler 子图查询：采样器持有的是名称，
+        但 ES 关系索引 store 的是 ID，必须反解后才能构建 terms 查询。
+
+        Parameters
+        ----------
+        names : List[str]
+            实体名称列表。
+
+        Returns
+        -------
+        List[str]
+            对应的原始 entityId 列表（无法反解的保留原名作为 fallback）。
+        """
+        return [self.entity_name_to_id.get(n, n) for n in names]
+
+    def resolve_triplets(
+            self,
+            triplets: List[dict],
+    ) -> Tuple[List[dict], int, int]:
+        """将原始 ID 三元组解析为名称三元组。
+
+        对齐原 _load_relations_as_triples 的解析逻辑：
+        - 头尾实体 ID → entity_map → 名称
+        - 关系类型 ID → relation_type_map → 名称
+        - 任一无法解析则跳过
+        - 按 (head, relation, tail) 去重
+
+        Parameters
+        ----------
+        triplets : List[dict]
+            原始 ID 三元组列表，每项 {"head": id, "relation": id, "tail": id}。
+
+        Returns
+        -------
+        Tuple[List[dict], int, int]
+            (解析后的名称三元组列表, 解析成功数, 跳过数)
+        """
+        resolved: List[dict] = []
+        skipped = 0
+        seen: Set[Tuple[str, str, str]] = set()
+        # 收集前几个无法解析的 ID 样本，用于诊断日志
+        _unresolved_samples: List[Tuple[str, str, str]] = []
+
+        for t in triplets:
+            head_id = t["head"]
+            tail_id = t["tail"]
+            relation_id = t["relation"]
+
+            # 二次查询：将 ID 映射为名称
+            head_name = self.entity_map.get(head_id)
+            tail_name = self.entity_map.get(tail_id)
+            relation_name = self.relation_type_map.get(relation_id)
+
+            if head_name is None or tail_name is None or relation_name is None:
+                skipped += 1
+                if len(_unresolved_samples) < 3:
+                    _unresolved_samples.append((head_id, relation_id, tail_id))
+                continue
+
+            # 去重
+            dedup_key = (head_name, relation_name, tail_name)
+            if dedup_key in seen:
+                skipped += 1
+                continue
+            seen.add(dedup_key)
+
+            resolved.append({
+                "head": head_name,
+                "relation": relation_name,
+                "tail": tail_name,
+            })
+
+        if skipped > 0 and len(resolved) == 0:
+            entity_keys_sample = list(self.entity_map.keys())[:5] if self.entity_map else []
+            rel_keys_sample = list(self.relation_type_map.keys())[:5] if self.relation_type_map else []
+            sample = _unresolved_samples[0] if _unresolved_samples else ("?", "?", "?")
+            logger.warning(
+                "⚠️  本批次 %d 条三元组全部无法解析为名称！\n"
+                "  未解析样本: head_id=%s, relation_id=%s, tail_id=%s\n"
+                "  entity_map 样本键(前5): %s\n"
+                "  relation_type_map 样本键(前5): %s\n"
+                "  → 检查 entity_map/relation_type_map 的 ID 是否与关系索引一致。",
+                skipped,
+                sample[0], sample[1], sample[2],
+                entity_keys_sample,
+                rel_keys_sample,
+            )
+        elif skipped > 0 and skipped >= len(resolved) * 2:
+            logger.warning(
+                "⚠️  本批次 %d 条跳过 (%.0f%%)，部分 ID 无法解析。"
+                "样本: %s。可能 ID/名称字段不匹配。",
+                skipped, skipped / max(skipped + len(resolved), 1) * 100,
+                _unresolved_samples[:2] if _unresolved_samples else "?",
+            )
+
+        return resolved, len(resolved), skipped
+
+    @property
+    def is_ready(self) -> bool:
+        """两个映射均已构建完成。"""
+        return bool(self.entity_map) and bool(self.relation_type_map)
+
+
+# ============================================================
+# 5. ES 流式三元组提取器（search_after 替代 scroll，解决上亿数据深分页问题）
 # ============================================================
 class ESTripletStreamer:
     """使用 search_after 替代 scroll/scan，避免深分页性能灾难。
@@ -695,12 +1114,13 @@ class ESTripletStreamer:
     MAX_QUEUE_SIZE = 4
 
     def __init__(
-        self,
-        es_hosts: List[str],
-        index_name: Union[str, List[str]],
-        batch_size: int = 5000,
-        prefetch: bool = True,
-        checkpoint_dir: Optional[str] = None,
+            self,
+            es_hosts: List[str],
+            index_name: Union[str, List[str]],
+            batch_size: int = 5000,
+            prefetch: bool = True,
+            checkpoint_dir: Optional[str] = None,
+            resolver: Optional["IDNameResolver"] = None,
     ):
         """
         Parameters
@@ -715,6 +1135,9 @@ class ESTripletStreamer:
             是否启用异步预取（后台线程提前拉取下一批）。
         checkpoint_dir : Optional[str]
             断点续传目录，用于保存/恢复 progress。
+        resolver : Optional[IDNameResolver]
+            ID→名称解析器。若提供，stream_triplets_raw 将在产出前自动将
+            原始 entityId/relationTypeId 解析为可读名称。
         """
         self.es = Elasticsearch(es_hosts)
         # 支持多索引：列表转逗号分隔字符串
@@ -727,6 +1150,7 @@ class ESTripletStreamer:
         self.batch_size = batch_size
         self.prefetch = prefetch
         self.checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir else None
+        self.resolver = resolver
         if self.checkpoint_dir:
             self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
@@ -759,11 +1183,11 @@ class ESTripletStreamer:
 
     # ---------- 核心：search_after 流式遍历 ----------
     def _build_query(
-        self,
-        seed_entities: Optional[List[str]] = None,
-        head_field: str = "head_id",
-        tail_field: str = "tail_id",
-        extra_filters: Optional[dict] = None,
+            self,
+            seed_entities: Optional[List[str]] = None,
+            head_field: str = "head_id",
+            tail_field: str = "tail_id",
+            extra_filters: Optional[dict] = None,
     ) -> dict:
         """构建带排序的 search_after 查询体。"""
         if seed_entities:
@@ -784,20 +1208,24 @@ class ESTripletStreamer:
         }
 
     def stream_triplets_raw(
-        self,
-        seed_entities: Optional[List[str]] = None,
-        head_field: str = "head_id",
-        relation_field: str = "relation",
-        tail_field: str = "tail_id",
-        resume: bool = True,
-        extra_filters: Optional[dict] = None,
+            self,
+            seed_entities: Optional[List[str]] = None,
+            head_field: str = "head_id",
+            relation_field: str = "relation",
+            tail_field: str = "tail_id",
+            resume: bool = True,
+            extra_filters: Optional[dict] = None,
     ) -> Iterator[List[dict]]:
-        """流式生成原始三元组批次（dict 格式，不做 ID 映射）。
+        """流式生成原始三元组批次（dict 格式）。
+
+        若配置了 resolver，每批会在产出前自动将原始 ID 解析为可读名称；
+        无法解析的三元组会被跳过，对齐原 fetch_triples 的处理逻辑。
 
         Yields
         ------
         List[dict]
             每批三元组列表，每个三元组为 {"head": ..., "relation": ..., "tail": ...}。
+            字段值可能是原始 ID（无 resolver）或解析后的名称（有 resolver）。
         """
         query_body = self._build_query(
             seed_entities=seed_entities,
@@ -815,6 +1243,20 @@ class ESTripletStreamer:
 
         batch_count = 0
         total_docs = 0
+        total_skipped = 0
+        _resolver = self.resolver  # 局部引用，避免属性查找
+        _resolver_warned = False  # 仅警告一次
+
+        # 若配置了 resolver 但未就绪，在开始遍历时给出明确警告
+        if _resolver and not _resolver.is_ready:
+            logger.error(
+                "❌ ID→名称解析器已配置但未就绪！"
+                "实体名称映射=%d, 关系类型名称映射=%d。"
+                "词汇表将存储原始 ID 而非名称！"
+                "请检查 --graph-id / --ontology-id / --entity-name-field 参数。",
+                len(_resolver.entity_map), len(_resolver.relation_type_map),
+            )
+
         while True:
             if search_after:
                 query_body["search_after"] = search_after
@@ -837,7 +1279,7 @@ class ESTripletStreamer:
             batch_count += 1
             total_docs += len(hits)
 
-            # 提取三元组
+            # 提取三元组（原始 ID）
             triplets = []
             for hit in hits:
                 src = hit["_source"]
@@ -851,7 +1293,13 @@ class ESTripletStreamer:
                         "tail": str(t),
                     })
 
-            yield triplets
+            # 若配置了 ID→名称解析器，将原始 ID 解析为可读名称
+            if _resolver and _resolver.is_ready:
+                triplets, _, skipped = _resolver.resolve_triplets(triplets)
+                total_skipped += skipped
+
+            if triplets:
+                yield triplets
 
             # 更新游标
             search_after = hits[-1]["sort"]
@@ -861,16 +1309,19 @@ class ESTripletStreamer:
                 break  # 最后一批
 
         self._clear_progress()
-        logger.info("search_after 遍历完成: 共 %d 批, %d 条文档", batch_count, total_docs)
+        logger.info(
+            "search_after 遍历完成: 共 %d 批, %d 条文档, 已解析名称 (跳过 %d 条)",
+            batch_count, total_docs, total_skipped,
+        )
 
     def stream_triplets(
-        self,
-        seed_entities: Optional[List[str]] = None,
-        head_field: str = "head_id",
-        relation_field: str = "relation",
-        tail_field: str = "tail_id",
-        resume: bool = True,
-        extra_filters: Optional[dict] = None,
+            self,
+            seed_entities: Optional[List[str]] = None,
+            head_field: str = "head_id",
+            relation_field: str = "relation",
+            tail_field: str = "tail_id",
+            resume: bool = True,
+            extra_filters: Optional[dict] = None,
     ) -> Iterator[List[dict]]:
         """带异步预取的流式三元组迭代器（生产者-消费者模式）。
 
@@ -899,12 +1350,12 @@ class ESTripletStreamer:
             """生产者：在后台线程中从 ES 拉取数据。"""
             try:
                 for batch in self.stream_triplets_raw(
-                    seed_entities=seed_entities,
-                    head_field=head_field,
-                    relation_field=relation_field,
-                    tail_field=tail_field,
-                    resume=resume,
-                    extra_filters=extra_filters,
+                        seed_entities=seed_entities,
+                        head_field=head_field,
+                        relation_field=relation_field,
+                        tail_field=tail_field,
+                        resume=resume,
+                        extra_filters=extra_filters,
                 ):
                     data_queue.put(batch)  # 阻塞直到队列有空位
                 data_queue.put(stop_sentinel)
@@ -927,7 +1378,7 @@ class ESTripletStreamer:
 
 
 # ============================================================
-# 5. 全局词汇表构建器（entity2idx / relation2idx）
+# 6. 全局词汇表构建器（entity2idx / relation2idx）
 # ============================================================
 class KGVocabulary:
     """管理实体和关系的全局 ID 映射。
@@ -967,12 +1418,12 @@ class KGVocabulary:
         return self.relation2idx[relation]
 
     def build_from_streamer(
-        self,
-        streamer: ESTripletStreamer,
-        head_field: str = "head_id",
-        relation_field: str = "relation",
-        tail_field: str = "tail_id",
-        extra_filters: Optional[dict] = None,
+            self,
+            streamer: ESTripletStreamer,
+            head_field: str = "head_id",
+            relation_field: str = "relation",
+            tail_field: str = "tail_id",
+            extra_filters: Optional[dict] = None,
     ) -> int:
         """从 ESTripletStreamer 流式构建词汇表。
 
@@ -988,10 +1439,10 @@ class KGVocabulary:
         """
         total = 0
         for batch in streamer.stream_triplets(
-            head_field=head_field,
-            relation_field=relation_field,
-            tail_field=tail_field,
-            extra_filters=extra_filters,
+                head_field=head_field,
+                relation_field=relation_field,
+                tail_field=tail_field,
+                extra_filters=extra_filters,
         ):
             for t in batch:
                 self.add_entity(t["head"])
@@ -1009,10 +1460,74 @@ class KGVocabulary:
             "词汇表构建完成: 实体=%d, 关系=%d, 三元组=%d",
             self.num_entities, self.num_relations, total,
         )
+        self._warn_if_names_look_like_ids()
         return total
 
+    # ---------- 名称校验 ----------
+    @staticmethod
+    def _looks_like_id(s: str) -> bool:
+        """启发式检测：字符串是否看起来像原始 ID 而非人类可读名称。
+
+        规则：
+        - 纯数字串（如 "1234567890"）
+        - 以常见 ID 前缀开头的长串（如 "9800441..."、"src_"、"entity_"）
+        - 不含任何中文字符且长度 > 20 的字母数字串
+        """
+        if not s:
+            return False
+        # 包含中文 → 肯定是名称
+        if any('\u4e00' <= c <= '\u9fff' for c in s):
+            return False
+        # 全部是数字（大整数 ID）
+        if s.isdigit() and len(s) >= 10:
+            return True
+        # 长字母数字组合（如 UUID、MongoDB ObjectId）
+        if len(s) >= 20 and all(c.isalnum() or c in '-_' for c in s):
+            return True
+        return False
+
+    def _warn_if_names_look_like_ids(self) -> None:
+        """抽样检测词汇表中的键是否看起来像 ID，若是则发出明确警告。"""
+        entity_keys = list(self.entity2idx.keys())
+        relation_keys = list(self.relation2idx.keys())
+
+        # 抽样前 20 个
+        entity_sample = entity_keys[:20]
+        relation_sample = relation_keys[:20]
+
+        entity_id_count = sum(1 for e in entity_sample if self._looks_like_id(e))
+        relation_id_count = sum(1 for r in relation_sample if self._looks_like_id(r))
+
+        if entity_id_count > len(entity_sample) // 2 and entity_sample:
+            logger.warning(
+                "⚠️  词汇表中 %d/%d 个实体名称看起来像原始 ID（如 %s ...），"
+                "请检查：\n"
+                "  1. 是否启用了 --no-resolve？\n"
+                "  2. --entity-name-field 是否配置正确？（当前可能不是 'name'）\n"
+                "  3. 实体索引 %s 的 ID/名称字段是否匹配？\n"
+                "  可使用 --entity-name-field <字段名> 指定正确的名称字段。",
+                entity_id_count, len(entity_sample),
+                entity_sample[0][:40] if entity_sample else "",
+                getattr(self, '_entity_index_hint', 'knowledge_entity_index'),
+            )
+
+        if relation_id_count > len(relation_sample) // 2 and relation_sample:
+            logger.warning(
+                "⚠️  词汇表中 %d/%d 个关系类型名称看起来像原始 ID（如 %s ...），"
+                "请检查：\n"
+                "  1. 是否启用了 --no-resolve？\n"
+                "  2. --relation-type-name-field 是否配置正确？（当前可能不是 'name'）\n"
+                "  3. 关系类型索引 %s 的 ID/名称字段是否匹配？\n"
+                "  可使用 --relation-type-name-field <字段名> 指定正确的名称字段。",
+                relation_id_count, len(relation_sample),
+                relation_sample[0][:40] if relation_sample else "",
+                getattr(self, '_relation_type_index_hint', 'knowledge_entity_type_relation_index'),
+            )
+
     def save(self, filepath: str) -> None:
-        """持久化词汇表到磁盘。"""
+        """持久化词汇表到磁盘。保存前校验名称质量。"""
+        self._warn_if_names_look_like_ids()
+
         path = Path(filepath)
         path.parent.mkdir(parents=True, exist_ok=True)
         data = {
@@ -1041,7 +1556,7 @@ class KGVocabulary:
 
 
 # ============================================================
-# 6. 异步子图采样器 —— 核心："边查边训"引擎
+# 7. 异步子图采样器 —— 核心："边查边训"引擎
 # ============================================================
 class AsyncSubgraphSampler:
     """基于 ES + search_after 的异步子图采样器。
@@ -1056,16 +1571,17 @@ class AsyncSubgraphSampler:
     """
 
     def __init__(
-        self,
-        streamer: ESTripletStreamer,
-        vocab: KGVocabulary,
-        num_hops: int = 2,
-        max_neighbors_per_hop: int = 100,
-        prefetch_size: int = 2,
-        head_field: str = "head_id",
-        relation_field: str = "relation",
-        tail_field: str = "tail_id",
-        embedding_dim: int = 64,
+            self,
+            streamer: ESTripletStreamer,
+            vocab: KGVocabulary,
+            num_hops: int = 2,
+            max_neighbors_per_hop: int = 100,
+            prefetch_size: int = 2,
+            head_field: str = "head_id",
+            relation_field: str = "relation",
+            tail_field: str = "tail_id",
+            embedding_dim: int = 64,
+            resolver: Optional["IDNameResolver"] = None,
     ):
         """
         Parameters
@@ -1073,7 +1589,7 @@ class AsyncSubgraphSampler:
         streamer : ESTripletStreamer
             search_after 流式提取器。
         vocab : KGVocabulary
-            全局实体/关系 ID 映射。
+            全局实体/关系 ID 映射（存名称）。
         num_hops : int
             邻居采样的跳数。
         max_neighbors_per_hop : int
@@ -1084,6 +1600,8 @@ class AsyncSubgraphSampler:
             ES 索引中的字段名。
         embedding_dim : int
             实体特征嵌入维度（实际特征应从 ES 另一索引或外部特征源获取）。
+        resolver : Optional[IDNameResolver]
+            ID↔名称解析器。用于将 seed 实体名称反解为 ES 查询所需的原始 ID。
         """
         self.streamer = streamer
         self.vocab = vocab
@@ -1094,6 +1612,7 @@ class AsyncSubgraphSampler:
         self.relation_field = relation_field
         self.tail_field = tail_field
         self.embedding_dim = embedding_dim
+        self.resolver = resolver
 
         # 预取队列与线程
         self._prefetch_queue: queue.Queue = queue.Queue(maxsize=prefetch_size)
@@ -1102,9 +1621,9 @@ class AsyncSubgraphSampler:
         self._prefetch_error: Optional[Exception] = None
 
     def sample_subgraph(
-        self,
-        seed_entities: List[str],
-        num_hops: Optional[int] = None,
+            self,
+            seed_entities: List[str],
+            num_hops: Optional[int] = None,
     ) -> Optional[HeteroData]:
         """从 ES 动态构建以 seed_entities 为中心的局部子图。
 
@@ -1126,6 +1645,13 @@ class AsyncSubgraphSampler:
         edges: List[Tuple[int, int, int]] = []  # (head_idx, rel_idx, tail_idx)
         local_entities: Dict[str, int] = {}  # 子图内实体 → 局部索引
 
+        # 若配置了名称→ID 反向映射，每次查询前将 frontier 回译为 ES 可识别的原始 ID
+        _resolve_names = (
+            self.resolver.resolve_entity_names_to_ids
+            if self.resolver and self.resolver.is_ready
+            else lambda names: names
+        )
+
         for hop in range(hops):
             if not frontier:
                 break
@@ -1137,14 +1663,16 @@ class AsyncSubgraphSampler:
             # 分批查询（ES terms query 有长度限制）
             chunk_size = 1000
             for i in range(0, len(frontier_list), chunk_size):
-                chunk = frontier_list[i:i + chunk_size]
+                chunk_raw = frontier_list[i:i + chunk_size]
+                # ↓ 关键：将实体名称回译为 ES 索引中的原始 ID
+                chunk = _resolve_names(chunk_raw)
 
                 for batch in self.streamer.stream_triplets(
-                    seed_entities=chunk,
-                    head_field=self.head_field,
-                    relation_field=self.relation_field,
-                    tail_field=self.tail_field,
-                    resume=False,  # 子图查询不续传
+                        seed_entities=chunk,
+                        head_field=self.head_field,
+                        relation_field=self.relation_field,
+                        tail_field=self.tail_field,
+                        resume=False,  # 子图查询不续传
                 ):
                     for t in batch:
                         h, r, tail = t["head"], t["relation"], t["tail"]
@@ -1198,8 +1726,8 @@ class AsyncSubgraphSampler:
 
     # ---------- 异步预取流水线 ----------
     def _prefetch_worker(
-        self,
-        seed_batches: Iterator[List[str]],
+            self,
+            seed_batches: Iterator[List[str]],
     ) -> None:
         """后台预取线程：持续从 ES 拉取子图并放入队列。"""
         try:
@@ -1214,8 +1742,8 @@ class AsyncSubgraphSampler:
             self._prefetch_queue.put(None)
 
     def iter_subgraphs(
-        self,
-        seed_batches: List[List[str]],
+            self,
+            seed_batches: List[List[str]],
     ) -> Iterator[Tuple[List[str], Optional[HeteroData]]]:
         """同步迭代器：逐个返回 (种子节点, 子图)。
 
@@ -1228,8 +1756,8 @@ class AsyncSubgraphSampler:
             yield seeds, self.sample_subgraph(seeds)
 
     def iter_subgraphs_async(
-        self,
-        seed_batches: List[List[str]],
+            self,
+            seed_batches: List[List[str]],
     ) -> Iterator[Tuple[List[str], Optional[HeteroData]]]:
         """异步预取迭代器：后台拉取 + 主线程消费。
 
@@ -1281,7 +1809,7 @@ class AsyncSubgraphSampler:
 
 
 # ============================================================
-# 7. PyG NeighborLoader 适配器（全图在内存时使用）
+# 8. PyG NeighborLoader 适配器（全图在内存时使用）
 # ============================================================
 class KGNeighborLoaderAdapter:
     """将 ES 流式构建的全图适配为 PyG NeighborLoader。
@@ -1296,12 +1824,12 @@ class KGNeighborLoaderAdapter:
     """
 
     def __init__(
-        self,
-        vocab: KGVocabulary,
-        edge_index: torch.Tensor,
-        edge_type: Optional[torch.Tensor] = None,
-        node_features: Optional[torch.Tensor] = None,
-        embedding_dim: int = 64,
+            self,
+            vocab: KGVocabulary,
+            edge_index: torch.Tensor,
+            edge_type: Optional[torch.Tensor] = None,
+            node_features: Optional[torch.Tensor] = None,
+            embedding_dim: int = 64,
     ):
         """
         Parameters
@@ -1333,12 +1861,12 @@ class KGNeighborLoaderAdapter:
             self.data["entity", "to", "entity"].edge_type = edge_type
 
     def create_loader(
-        self,
-        input_nodes: torch.Tensor,
-        num_neighbors: List[int] = None,
-        batch_size: int = 128,
-        shuffle: bool = True,
-        **kwargs,
+            self,
+            input_nodes: torch.Tensor,
+            num_neighbors: List[int] = None,
+            batch_size: int = 128,
+            shuffle: bool = True,
+            **kwargs,
     ) -> NeighborLoader:
         """创建 PyG NeighborLoader。
 
@@ -1367,14 +1895,14 @@ class KGNeighborLoaderAdapter:
 
     @classmethod
     def from_streamer(
-        cls,
-        streamer: ESTripletStreamer,
-        vocab: Optional[KGVocabulary] = None,
-        head_field: str = "head_id",
-        relation_field: str = "relation",
-        tail_field: str = "tail_id",
-        embedding_dim: int = 64,
-        node_features: Optional[torch.Tensor] = None,
+            cls,
+            streamer: ESTripletStreamer,
+            vocab: Optional[KGVocabulary] = None,
+            head_field: str = "head_id",
+            relation_field: str = "relation",
+            tail_field: str = "tail_id",
+            embedding_dim: int = 64,
+            node_features: Optional[torch.Tensor] = None,
     ) -> "KGNeighborLoaderAdapter":
         """从 ESTripletStreamer 一键构建全图 + NeighborLoader 适配器。
 
@@ -1388,9 +1916,9 @@ class KGNeighborLoaderAdapter:
         total = 0
 
         for batch in streamer.stream_triplets(
-            head_field=head_field,
-            relation_field=relation_field,
-            tail_field=tail_field,
+                head_field=head_field,
+                relation_field=relation_field,
+                tail_field=tail_field,
         ):
             for t in batch:
                 h_idx = vocab.add_entity(t["head"])
@@ -1428,7 +1956,7 @@ class KGNeighborLoaderAdapter:
 
 
 # ============================================================
-# 8. "边查边训" 训练流水线
+# 9. "边查边训" 训练流水线
 # ============================================================
 class StreamingTrainingPipeline:
     """将异步 ES 子图采样与 PyG 训练循环集成的流水线。
@@ -1441,11 +1969,11 @@ class StreamingTrainingPipeline:
     """
 
     def __init__(
-        self,
-        streamer: ESTripletStreamer,
-        vocab: Optional[KGVocabulary] = None,
-        mode: str = "streaming",
-        **sampler_kwargs,
+            self,
+            streamer: ESTripletStreamer,
+            vocab: Optional[KGVocabulary] = None,
+            mode: str = "streaming",
+            **sampler_kwargs,
     ):
         """
         Parameters
@@ -1468,10 +1996,10 @@ class StreamingTrainingPipeline:
         self._loader_adapter: Optional[KGNeighborLoaderAdapter] = None
 
     def build_vocab(
-        self,
-        head_field: str = "head_id",
-        relation_field: str = "relation",
-        tail_field: str = "tail_id",
+            self,
+            head_field: str = "head_id",
+            relation_field: str = "relation",
+            tail_field: str = "tail_id",
     ) -> KGVocabulary:
         """第一阶段：构建全局词汇表（只需一次）。"""
         self.vocab.build_from_streamer(
@@ -1483,12 +2011,12 @@ class StreamingTrainingPipeline:
         return self.vocab
 
     def prepare(
-        self,
-        seed_batches: Optional[List[List[str]]] = None,
-        input_nodes: Optional[torch.Tensor] = None,
-        head_field: str = "head_id",
-        relation_field: str = "relation",
-        tail_field: str = "tail_id",
+            self,
+            seed_batches: Optional[List[List[str]]] = None,
+            input_nodes: Optional[torch.Tensor] = None,
+            head_field: str = "head_id",
+            relation_field: str = "relation",
+            tail_field: str = "tail_id",
     ) -> Iterator:
         """准备训练数据迭代器。
 
@@ -1517,11 +2045,11 @@ class StreamingTrainingPipeline:
             )
 
     def _prepare_full_mode(
-        self,
-        input_nodes: Optional[torch.Tensor],
-        head_field: str,
-        relation_field: str,
-        tail_field: str,
+            self,
+            input_nodes: Optional[torch.Tensor],
+            head_field: str,
+            relation_field: str,
+            tail_field: str,
     ) -> NeighborLoader:
         """全图模式：构建完整图 + NeighborLoader。"""
         logger.info("全图模式: 开始构建全局图...")
@@ -1545,11 +2073,11 @@ class StreamingTrainingPipeline:
         return loader
 
     def _prepare_streaming_mode(
-        self,
-        seed_batches: Optional[List[List[str]]],
-        head_field: str,
-        relation_field: str,
-        tail_field: str,
+            self,
+            seed_batches: Optional[List[List[str]]],
+            head_field: str,
+            relation_field: str,
+            tail_field: str,
     ) -> AsyncSubgraphSampler:
         """流式模式：创建异步子图采样器。"""
         if seed_batches is None:
@@ -1571,6 +2099,486 @@ class StreamingTrainingPipeline:
         """清理资源。"""
         if self._sampler:
             self._sampler.shutdown()
+
+
+# ============================================================
+# 10. 故障标签构建器 —— 从 ES 数据中识别故障节点
+# ============================================================
+class FaultLabelBuilder:
+    """从已解析的知识图谱中自动识别故障节点并构建训练标签。
+
+    识别策略：
+    1. 基于关系模式匹配：查找 (实体 --关系类型--> 尾实体) 中
+       relation ∈ fault_relations 且 tail ∈ fault_tails 的实体，
+       将其标记为故障节点。
+    2. 默认匹配："类型为" → "故障" 模式，覆盖常见工业故障分类。
+    """
+
+    # 默认故障类型指示关系（中文 KG 常见模式）
+    DEFAULT_FAULT_RELATIONS = [
+        "类型为", "type", "rdf:type", "类别为", "分类为",
+        "is_fault", "故障类型", "fault_type",
+    ]
+    # 默认故障类目名
+    DEFAULT_FAULT_TAILS = ["故障", "fault", "Failure", "异常", "失效"]
+
+    def __init__(
+            self,
+            vocab: KGVocabulary,
+            fault_relations: Optional[List[str]] = None,
+            fault_tails: Optional[List[str]] = None,
+    ):
+        """
+        Parameters
+        ----------
+        vocab : KGVocabulary
+            全局词汇表，已包含所有实体和关系类型。
+        fault_relations : Optional[List[str]]
+            指示故障分类的关系名称列表，默认使用 DEFAULT_FAULT_RELATIONS。
+        fault_tails : Optional[List[str]]
+            故障类别的尾实体名称列表，默认使用 DEFAULT_FAULT_TAILS。
+        """
+        self.vocab = vocab
+        self.fault_relations = fault_relations or self.DEFAULT_FAULT_RELATIONS
+        self.fault_tails = fault_tails or self.DEFAULT_FAULT_TAILS
+
+        self.fault_nodes: List[str] = []
+        self.y: Optional[torch.Tensor] = None
+        self.fault_mask: Optional[torch.Tensor] = None
+
+    def build_from_streamer(
+            self,
+            streamer: "ESTripletStreamer",
+            head_field: str = "head_id",
+            relation_field: str = "relation",
+            tail_field: str = "tail_id",
+            extra_filters: Optional[dict] = None,
+    ) -> Tuple[torch.Tensor, List[str]]:
+        """全量扫描三元组，根据关系模式识别故障节点。
+
+        遍历所有三元组，当 relation ∈ fault_relations 且 tail ∈ fault_tails 时，
+        将 head 实体标记为故障节点。遍历结束后为所有实体生成 0/1 标签张量。
+
+        Parameters
+        ----------
+        streamer : ESTripletStreamer
+            已配置解析器的流式提取器（需启用 ID→名称解析）。
+        head_field / relation_field / tail_field : str
+            ES 索引中的字段名。
+        extra_filters : Optional[dict]
+            额外的 ES 查询过滤条件。
+
+        Returns
+        -------
+        Tuple[torch.Tensor, List[str]]
+            (y: 标签张量 [num_entities], fault_nodes: 故障节点名称列表)
+        """
+        _fault_relation_set = set(self.fault_relations)
+        _fault_tail_set = set(self.fault_tails)
+        fault_set: Set[str] = set()
+
+        total_scanned = 0
+        logger.info("开始扫描三元组以识别故障节点 ...")
+        for batch in streamer.stream_triplets(
+                head_field=head_field,
+                relation_field=relation_field,
+                tail_field=tail_field,
+                extra_filters=extra_filters,
+                resume=False,
+        ):
+            for t in batch:
+                head, rel, tail = t["head"], t["relation"], t["tail"]
+                if rel in _fault_relation_set and tail in _fault_tail_set:
+                    if head in self.vocab.entity2idx:
+                        fault_set.add(head)
+                total_scanned += 1
+
+        self.fault_nodes = sorted(fault_set)
+
+        # 构建标签张量
+        num_entities = self.vocab.num_entities
+        y_list = []
+        for i in range(num_entities):
+            entity_name = self.vocab.idx2entity[i]
+            y_list.append(1 if entity_name in fault_set else 0)
+
+        self.y = torch.tensor(y_list, dtype=torch.long)
+        self.fault_mask = self.y.bool()
+
+        fault_count = int(self.y.sum().item())
+        logger.info(
+            "故障节点识别完成: 扫描 %d 条三元组, 识别 %d 个故障节点 / 共 %d 个实体 (%.2f%%)",
+            total_scanned, fault_count, num_entities,
+            100.0 * fault_count / max(num_entities, 1),
+        )
+        if fault_count == 0:
+            logger.warning(
+                "未识别到任何故障节点！请检查 fault_relations=%s 和 fault_tails=%s "
+                "是否与知识图谱中的实际关系/尾实体匹配",
+                self.fault_relations, self.fault_tails,
+            )
+
+        return self.y, self.fault_nodes
+
+    @property
+    def num_faults(self) -> int:
+        return len(self.fault_nodes)
+
+    @property
+    def num_entities(self) -> int:
+        return self.vocab.num_entities
+
+    @property
+    def num_normal(self) -> int:
+        return self.num_entities - self.num_faults
+
+
+# ============================================================
+# 11. 训练 + 推理集成管线
+# ============================================================
+class KGTrainInferPipeline:
+    """端到端：ES 数据读取 → 训练 → 评估 → 故障推理。
+
+    封装完整的 GCN 训练和 Top-K 故障诊断流程，可与 ES 全图/流式
+    两种数据模式配合使用。
+
+    使用示例::
+
+        pipeline = KGTrainInferPipeline()
+        pipeline.train(
+            loader=neighbor_loader,
+            y=labels,
+            epochs=200,
+        )
+        results = pipeline.infer_topk(
+            model=pipeline.model,
+            data=full_graph_data,
+            symptoms=["振动过高", "温度过高"],
+            node_to_idx=vocab.entity2idx,
+            fault_nodes=["轴承磨损", "定子故障"],
+        )
+    """
+
+    def __init__(
+            self,
+            in_dim: int = 64,
+            hidden_dim: int = 32,
+            num_classes: int = 2,
+            lr: float = 0.01,
+            weight_decay: float = 5e-4,
+            device: Optional[str] = None,
+    ):
+        """
+        Parameters
+        ----------
+        in_dim : int
+            输入特征维度（应与节点嵌入维度一致）。
+        hidden_dim : int
+            隐藏层维度。
+        num_classes : int
+            分类类别数（默认 2: 正常/故障）。
+        lr : float
+            学习率。
+        weight_decay : float
+            L2 正则化权重衰减。
+        device : Optional[str]
+            训练设备，None 则自动选择 cuda/cpu。
+        """
+        self.in_dim = in_dim
+        self.hidden_dim = hidden_dim
+        self.num_classes = num_classes
+        self.lr = lr
+        self.weight_decay = weight_decay
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+
+        self.model: Optional["FaultGCN"] = None
+        self.optimizer = None
+        self.criterion = nn.CrossEntropyLoss()
+
+    def _init_model(self) -> "FaultGCN":
+        from kg_fault_diagnosis import FaultGCN
+        model = FaultGCN(in_dim=self.in_dim, hidden_dim=self.hidden_dim)
+        if self.num_classes != 2:
+            model.classifier = nn.Linear(self.hidden_dim, self.num_classes)
+        model.to(self.device)
+        self.model = model
+        self.optimizer = torch.optim.Adam(
+            model.parameters(), lr=self.lr, weight_decay=self.weight_decay,
+        )
+        return model
+
+    # ---- 全图模式训练（Data / HeteroData） ----
+    def train_full_graph(
+            self,
+            data: Union[Data, HeteroData],
+            y: torch.Tensor,
+            train_mask: torch.Tensor,
+            val_mask: torch.Tensor,
+            epochs: int = 200,
+            log_interval: int = 50,
+            verbose: bool = True,
+    ) -> Dict[str, list]:
+        """在全图上训练 FaultGCN（使用 train/val mask）。
+
+        Parameters
+        ----------
+        data : Data or HeteroData
+            包含 x, edge_index 的图数据。
+        y : torch.Tensor
+            所有节点的标签 [num_nodes]。
+        train_mask : torch.Tensor
+            训练集 mask [num_nodes]。
+        val_mask : torch.Tensor
+            验证集 mask [num_nodes]。
+        epochs : int
+            训练轮数。
+        log_interval : int
+            日志输出间隔。
+        verbose : bool
+            是否打印训练日志。
+
+        Returns
+        -------
+        Dict[str, list]
+            包含 epoch, train_loss, val_acc 的历史记录。
+        """
+        model = self._init_model()
+        data = data.to(self.device)
+        y = y.to(self.device)
+        train_mask = train_mask.to(self.device)
+        val_mask = val_mask.to(self.device)
+
+        history = {"epoch": [], "train_loss": [], "val_acc": []}
+
+        for epoch in range(1, epochs + 1):
+            model.train()
+            self.optimizer.zero_grad()
+            logits = model(data)
+            loss = self.criterion(logits[train_mask], y[train_mask])
+            loss.backward()
+            self.optimizer.step()
+
+            train_loss = loss.item()
+
+            if epoch % log_interval == 0 or epoch == 1 or epoch == epochs:
+                model.eval()
+                with torch.no_grad():
+                    pred = model(data).argmax(dim=1)
+                    val_acc = (pred[val_mask] == y[val_mask]).float().mean().item()
+                history["epoch"].append(epoch)
+                history["train_loss"].append(train_loss)
+                history["val_acc"].append(val_acc)
+                if verbose:
+                    logger.info(
+                        "Epoch %03d | loss=%.4f | val_acc=%.4f",
+                        epoch, train_loss, val_acc,
+                    )
+
+        return history
+
+    # ---- NeighborLoader 模式训练 ----
+    def train_with_loader(
+            self,
+            loader,
+            epochs: int = 10,
+            log_interval: int = 1,
+            verbose: bool = True,
+    ) -> Dict[str, list]:
+        """使用 PyG NeighborLoader 进行 mini-batch 训练。
+
+        Parameters
+        ----------
+        loader : NeighborLoader
+            PyG NeighborLoader 迭代器。
+        epochs : int
+            训练轮数。
+        log_interval : int
+            日志输出间隔。
+        verbose : bool
+            是否打印训练日志。
+
+        Returns
+        -------
+        Dict[str, list]
+            训练历史记录。
+        """
+        model = self._init_model()
+        history = {"epoch": [], "train_loss": []}
+
+        for epoch in range(1, epochs + 1):
+            model.train()
+            total_loss = 0.0
+            batch_count = 0
+
+            for batch in loader:
+                batch = batch.to(self.device)
+                self.optimizer.zero_grad()
+                logits = model(batch)
+
+                # 从 batch 中提取标签（需要预先设置）
+                if hasattr(batch, "y") and batch.y is not None:
+                    target = batch.y[: logits.shape[0]]
+                else:
+                    target = torch.zeros(logits.shape[0], dtype=torch.long, device=self.device)
+
+                loss = self.criterion(logits, target)
+                loss.backward()
+                self.optimizer.step()
+                total_loss += loss.item()
+                batch_count += 1
+
+            avg_loss = total_loss / max(batch_count, 1)
+            history["epoch"].append(epoch)
+            history["train_loss"].append(avg_loss)
+            if verbose and (epoch % log_interval == 0 or epoch == 1 or epoch == epochs):
+                logger.info("Epoch %03d | avg_loss=%.4f | batches=%d", epoch, avg_loss, batch_count)
+
+        return history
+
+    # ---- 评估 ----
+    @staticmethod
+    def evaluate(
+            data: Union[Data, HeteroData],
+            y: torch.Tensor,
+            test_mask: torch.Tensor,
+            model: Optional["FaultGCN"] = None,
+    ) -> Dict[str, float]:
+        """在测试集上评估模型。
+
+        Returns
+        -------
+        Dict[str, float]
+            {"accuracy": ..., "precision": ..., "recall": ..., "f1": ...}
+        """
+        if model is None:
+            raise ValueError("model 不能为 None，请先训练或加载模型")
+
+        model.eval()
+        device = next(model.parameters()).device
+        data = data.to(device)
+        y = y.to(device)
+        test_mask = test_mask.to(device)
+
+        with torch.no_grad():
+            pred = model(data).argmax(dim=1)
+
+        from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+        test_true = y[test_mask].cpu().numpy()
+        test_pred = pred[test_mask].cpu().numpy()
+
+        return {
+            "accuracy": float(accuracy_score(test_true, test_pred)),
+            "precision": float(precision_score(test_true, test_pred, zero_division=0)),
+            "recall": float(recall_score(test_true, test_pred, zero_division=0)),
+            "f1": float(f1_score(test_true, test_pred, zero_division=0)),
+        }
+
+    # ---- Top-K 故障诊断推理 ----
+    @staticmethod
+    def infer_topk(
+            model: "FaultGCN",
+            data: Union[Data, HeteroData],
+            symptoms: List[str],
+            node_to_idx: Dict[str, int],
+            fault_nodes: List[str],
+            top_k: int = 5,
+    ) -> List[Tuple[str, float]]:
+        """给定症状节点，基于嵌入余弦相似度推理最可能的故障根因。
+
+        Parameters
+        ----------
+        model : FaultGCN
+            已训练好的 GCN 模型。
+        data : Data or HeteroData
+            图数据。
+        symptoms : List[str]
+            症状节点名称列表。
+        node_to_idx : Dict[str, int]
+            节点名称到索引的映射。
+        fault_nodes : List[str]
+            候选故障节点名称列表。
+        top_k : int
+            返回的 Top-K 结果数。
+
+        Returns
+        -------
+        List[Tuple[str, float]]
+            按相似度降序排列的 (故障节点, 相似度) 列表。
+        """
+        model.eval()
+        device = next(model.parameters()).device
+        data = data.to(device)
+
+        with torch.no_grad():
+            node_emb = model.encode(data)
+
+            # 症状节点嵌入取平均作为查询向量
+            symptom_indices = [
+                node_to_idx[s] for s in symptoms if s in node_to_idx
+            ]
+            if not symptom_indices:
+                raise ValueError(f"所有症状节点均不在图中: {symptoms}")
+
+            query_emb = node_emb[symptom_indices].mean(dim=0, keepdim=True)
+
+            # 候选故障节点嵌入
+            candidate_indices = [
+                node_to_idx[f] for f in fault_nodes if f in node_to_idx
+            ]
+            if not candidate_indices:
+                raise ValueError(f"所有候选故障节点均不在图中: {fault_nodes}")
+
+            candidate_emb = node_emb[candidate_indices]
+            # 有效候选节点名称（对齐索引）
+            valid_fault_names = [
+                f for f in fault_nodes if f in node_to_idx
+            ]
+
+            # 余弦相似度
+            query_norm = F.normalize(query_emb, p=2, dim=-1)
+            cand_norm = F.normalize(candidate_emb, p=2, dim=-1)
+            scores = (cand_norm * query_norm).sum(dim=-1)
+
+            ranked = sorted(
+                zip(valid_fault_names, scores.cpu().tolist()),
+                key=lambda item: item[1],
+                reverse=True,
+            )
+            return ranked[:top_k]
+
+    # ---- 模型保存 / 加载 ----
+    def save_model(self, filepath: str) -> None:
+        """保存模型参数到磁盘。"""
+        if self.model is None:
+            raise RuntimeError("没有可保存的模型，请先训练")
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({
+            "model_state_dict": self.model.state_dict(),
+            "in_dim": self.in_dim,
+            "hidden_dim": self.hidden_dim,
+            "num_classes": self.num_classes,
+        }, path)
+        logger.info("模型已保存至 %s", filepath)
+
+    def load_model(self, filepath: str) -> "FaultGCN":
+        """从磁盘加载模型参数。"""
+        from kg_fault_diagnosis import FaultGCN
+        checkpoint = torch.load(filepath, map_location=self.device, weights_only=False)
+        model = FaultGCN(
+            in_dim=checkpoint["in_dim"],
+            hidden_dim=checkpoint["hidden_dim"],
+        )
+        if checkpoint.get("num_classes", 2) != 2:
+            model.classifier = nn.Linear(checkpoint["hidden_dim"], checkpoint["num_classes"])
+        model.load_state_dict(checkpoint["model_state_dict"])
+        model.to(self.device)
+        self.in_dim = checkpoint["in_dim"]
+        self.hidden_dim = checkpoint["hidden_dim"]
+        self.num_classes = checkpoint.get("num_classes", 2)
+        self.model = model
+        logger.info("模型已从 %s 加载", filepath)
+        return model
 
 
 # -------------------- 便捷函数 --------------------
@@ -1635,12 +2643,39 @@ def main() -> None:
     parser.add_argument("--head-field", default="srcEntityId")
     parser.add_argument("--relation-field", default="relationTypeId")
     parser.add_argument("--tail-field", default="dstEntityId")
-    parser.add_argument("--graph-id", default=None, help="按 graphId 过滤（如 980044155496734720）")
+
+    parser.add_argument("--graph-id", default="986946166448234496", help="按 graphId 过滤（如 980044155496734720）")
+    parser.add_argument("--ontology-id", default="986946166448234496", help="关系类型 ontologyId")
+
+    # ID→名称解析索引（对齐原 fetch_triples 三步逻辑）
+    parser.add_argument("--entity-index", default="knowledge_entity_index", help="实体索引名称")
+    parser.add_argument("--entity-id-field", default="entityId", help="实体索引中的 ID 字段名")
+    parser.add_argument("--entity-name-field", default="name",
+                        help="实体索引中的名称字段名（如 name / entityName / displayName）")
+    parser.add_argument("--relation-type-index", default="knowledge_entity_type_relation_index",
+                        help="关系类型索引名称")
+    parser.add_argument("--relation-type-id-field", default="relationTypeId", help="关系类型索引中的 ID 字段名")
+    parser.add_argument("--relation-type-name-field", default="name",
+                        help="关系类型索引中的名称字段名（如 name / typeName / label）")
+    parser.add_argument("--no-resolve", action="store_true", help="禁用 ID 到名称的解析（直接使用原始 ID）")
+    parser.add_argument("--resolve-debug", action="store_true", help="启用解析器调试模式：采样索引文档并输出字段名")
+    # 故障标签 & 推理参数
+    parser.add_argument("--fault-relations", nargs="+",
+                        default=["类型为", "type", "rdf:type", "类别为", "is_fault", "故障类型"],
+                        help="标识故障分类的关系名称列表")
+    parser.add_argument("--fault-tails", nargs="+",
+                        default=["故障", "fault", "Failure", "异常", "失效"],
+                        help="故障类目尾实体名称列表")
+    parser.add_argument("--gcn-epochs", type=int, default=200, help="GCN 训练轮数")
+    parser.add_argument("--no-infer", action="store_true", help="跳过推理阶段")
+    parser.add_argument("--symptoms", nargs="+", default=None,
+                        help="推理时输入的症状节点名称（多个用空格分隔）")
+    parser.add_argument("--model-save", default="./models/kg_fault_model.pt", help="模型保存路径")
     args = parser.parse_args()
 
     config = ESConfig()
 
-    # ========== 模式 A: 传统模式（兼容旧代码） ==========
+    # ========== 模式 A: 传统模式（兼容旧代码 + 推理） ==========
     if args.mode == "legacy":
         reader = ESKnowledgeGraphReader(config)
         try:
@@ -1665,11 +2700,36 @@ def main() -> None:
             converter = TripleToDatasetConverter(triples)
             data = converter.to_data()
 
-            from kg_fault_diagnosis import FaultGCN, split_masks, train, evaluate
+            from kg_fault_diagnosis import FaultGCN, split_masks, train, evaluate, topk_fault_diagnosis
             data.train_mask, data.val_mask, data.test_mask = split_masks(data.num_nodes)
             model = FaultGCN(in_dim=data.num_features, hidden_dim=32)
             train(model, data)
             evaluate(model, data)
+
+            # 推理：Top-K 故障诊断
+            if not args.no_infer and converter.fault_nodes:
+                symptoms = args.symptoms
+                if symptoms is None:
+                    # 自动选取示例症状
+                    normal_nodes = [
+                        n for n, lbl in converter.labels.items() if lbl == 0
+                    ][:3]
+                    symptoms = normal_nodes if normal_nodes else ["泵_01"]
+                    logger.info("未指定 --symptoms，自动选取: %s", symptoms)
+
+                logger.info("\n执行 Top-K 故障诊断推理 ...")
+                try:
+                    results = topk_fault_diagnosis(
+                        model, data, converter, symptoms, top_k=min(5, len(converter.fault_nodes)),
+                    )
+                    logger.info("=" * 50)
+                    logger.info("  Top-K 故障诊断结果")
+                    logger.info("  输入症状: %s", ", ".join(symptoms))
+                    for rank, (fault, score) in enumerate(results, start=1):
+                        logger.info("  %d. %-30s similarity=%.4f", rank, fault, score)
+                    logger.info("=" * 50)
+                except ValueError as e:
+                    logger.warning("推理失败: %s", e)
         finally:
             reader.close()
         return
@@ -1679,17 +2739,71 @@ def main() -> None:
     index_names = args.index if len(args.index) > 1 else args.index[0]
     logger.info("目标索引: %s", index_names)
 
+    # ---------- 第一阶段：构建 ID→名称解析器 ----------
+    resolver = None
+    if not args.no_resolve:
+        logger.info("Phase 0: 构建 ID→名称解析器...")
+        if args.resolve_debug:
+            logger.info("[DEBUG] 解析器调试模式已启用")
+        es_client = Elasticsearch([f"{config.scheme}://{config.host}:{config.port}"])
+        resolver = IDNameResolver(es_client)
+        resolver.build_entity_map(
+            entity_index=args.entity_index,
+            graph_id=args.graph_id,
+            id_field=args.entity_id_field,
+            name_field=args.entity_name_field,
+            batch_size=args.batch_size,
+            extra_query={"match": {"graphId": args.graph_id}} if args.graph_id else None,
+            debug=args.resolve_debug,
+        )
+        resolver.build_relation_type_map(
+            relation_type_index=args.relation_type_index,
+            ontology_id=args.ontology_id,
+            id_field=args.relation_type_id_field,
+            name_field=args.relation_type_name_field,
+            batch_size=args.batch_size,
+            debug=args.resolve_debug,
+        )
+        logger.info(
+            "ID→名称解析器就绪: 实体=%d 种, 关系类型=%d 种",
+            len(resolver.entity_map), len(resolver.relation_type_map),
+        )
+        if not resolver.is_ready:
+            logger.error(
+                "❌ 解析器未就绪 (entity_map=%d, relation_type_map=%d)！"
+                "词汇表中的实体/关系名称将保持为原始 ID。"
+                "请运行 --resolve-debug 查看索引详情，"
+                "或检查 --graph-id / --ontology-id / --entity-name-field 等参数。",
+                len(resolver.entity_map), len(resolver.relation_type_map),
+            )
+
     streamer = ESTripletStreamer(
         es_hosts=[f"{config.scheme}://{config.host}:{config.port}"],
         index_name=index_names,
         batch_size=args.batch_size,
         prefetch=True,
         checkpoint_dir="./es_checkpoints",
+        resolver=resolver,
     )
 
-    # ---------- 第一阶段：构建全局词汇表 ----------
-    logger.info("Phase 1: 构建全局实体/关系词汇表...")
+    # ---------- 第二阶段：构建全局词汇表 ----------
+    logger.info("Phase 1: 构建全局实体/关系词汇表 (已解析为名称)...")
+    if resolver is None:
+        logger.warning(
+            "⚠️  未启用 ID→名称解析！词汇表中将存储原始 ID。"
+            "请确认是否需要名称解析（检查 --no-resolve 参数）"
+        )
+    else:
+        logger.info(
+            "解析器配置: 实体索引=%s (id=%s, name=%s), 关系类型索引=%s (id=%s, name=%s)",
+            args.entity_index, args.entity_id_field, args.entity_name_field,
+            args.relation_type_index, args.relation_type_id_field, args.relation_type_name_field,
+        )
+
     vocab = KGVocabulary(checkpoint_dir="./vocab_checkpoints")
+    # 注入索引名称提示（供警告信息使用）
+    vocab._entity_index_hint = args.entity_index
+    vocab._relation_type_index_hint = args.relation_type_index
 
     # 构建 graphId 过滤条件（对齐原代码默认行为）
     extra_filters = None
@@ -1706,9 +2820,17 @@ def main() -> None:
     )
     vocab.save("./vocab_checkpoints/vocab.json")
 
+    # 预览解析后的名称（前 5 个实体 + 前 3 个关系类型）
+    sample_entities = list(vocab.entity2idx.keys())[:5]
+    sample_relations = list(vocab.relation2idx.keys())[:3]
+    logger.info("解析后实体示例: %s", sample_entities)
+    logger.info("解析后关系类型示例: %s", sample_relations)
+
     if args.mode == "full":
-        # ========== 模式 B: 全图 NeighborLoader ==========
-        logger.info("模式 B: 全图模式 → 构建 edge_index + NeighborLoader")
+        # ========== 模式 B: 全图模式 → 真实标签训练 + 推理 ==========
+        logger.info("模式 B: 全图模式 → 构建 edge_index + 全图 GCN 训练 + 推理")
+
+        # Phase 2: 构建全图 edge_index（复用 vocab 中的实体/关系索引）
         adapter = KGNeighborLoaderAdapter.from_streamer(
             streamer=streamer,
             vocab=vocab,
@@ -1716,94 +2838,203 @@ def main() -> None:
             relation_field=args.relation_field,
             tail_field=args.tail_field,
         )
+        data = adapter.data
 
-        # 创建 NeighborLoader
-        all_nodes = torch.arange(vocab.num_entities, dtype=torch.long)
-        loader = adapter.create_loader(
-            input_nodes=all_nodes,
-            num_neighbors=[25, 10],
-            batch_size=128,
-            shuffle=True,
+        # Phase 3: 构建故障标签
+        logger.info("Phase 3: 识别故障节点并构建标签 ...")
+        label_builder = FaultLabelBuilder(
+            vocab=vocab,
+            fault_relations=args.fault_relations,
+            fault_tails=args.fault_tails,
+        )
+        y, fault_nodes = label_builder.build_from_streamer(
+            streamer=streamer,
+            head_field=args.head_field,
+            relation_field=args.relation_field,
+            tail_field=args.tail_field,
+            extra_filters=extra_filters,
+        )
+        data.y = y
+
+        if not fault_nodes:
+            logger.error(
+                "未识别到任何故障节点，无法训练。"
+                "请通过 --fault-relations / --fault-tails 指定正确的故障分类关系。"
+            )
+            return
+
+        # Phase 4: 划分 train/val/test
+        from kg_fault_diagnosis import split_masks
+        data.train_mask, data.val_mask, data.test_mask = split_masks(data["entity"].num_nodes)
+        logger.info(
+            "数据集划分: train=%d, val=%d, test=%d",
+            data.train_mask.sum().item(),
+            data.val_mask.sum().item(),
+            data.test_mask.sum().item(),
         )
 
-        # 标准 PyG 训练循环
-        from kg_fault_diagnosis import FaultGCN
-        from sklearn.metrics import accuracy_score
+        # Phase 5: 训练
+        logger.info("Phase 4: 全图 GCN 训练 (epochs=%d) ...", args.gcn_epochs)
+        pipeline = KGTrainInferPipeline(in_dim=adapter.embedding_dim, hidden_dim=32)
+        history = pipeline.train_full_graph(
+            data=data,
+            y=y,
+            train_mask=data.train_mask,
+            val_mask=data.val_mask,
+            epochs=args.gcn_epochs,
+            verbose=True,
+        )
 
-        model = FaultGCN(in_dim=64, hidden_dim=32)
-        optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+        # Phase 6: 评估
+        logger.info("Phase 5: 测试集评估 ...")
+        metrics = pipeline.evaluate(
+            data=data,
+            y=y,
+            test_mask=data.test_mask,
+            model=pipeline.model,
+        )
+        logger.info(
+            "测试集结果: Acc=%.4f, Prec=%.4f, Rec=%.4f, F1=%.4f",
+            metrics["accuracy"], metrics["precision"], metrics["recall"], metrics["f1"],
+        )
 
-        logger.info("开始训练 (NeighborLoader 模式)...")
-        for epoch in range(args.epochs):
-            model.train()
-            total_loss = 0.0
-            for batch in loader:
-                optimizer.zero_grad()
-                logits = model(batch)
-                loss = torch.nn.functional.cross_entropy(
-                    logits, torch.zeros(batch["entity"].num_nodes, dtype=torch.long)
+        # Phase 7: 推理 (Top-K 故障诊断)
+        if not args.no_infer and fault_nodes:
+            symptoms = args.symptoms
+            if symptoms is None:
+                # 自动选取非故障的节点作为示例症状
+                all_entity_names = list(vocab.entity2idx.keys())
+                non_fault_set = set(all_entity_names) - set(fault_nodes)
+                symptoms = list(non_fault_set)[:3] if non_fault_set else all_entity_names[:2]
+                logger.info("未指定 --symptoms，自动选取示例: %s", symptoms)
+
+            logger.info("Phase 6: Top-K 故障诊断推理 (symptoms=%s) ...", symptoms)
+            try:
+                results = pipeline.infer_topk(
+                    model=pipeline.model,
+                    data=data,
+                    symptoms=symptoms,
+                    node_to_idx=vocab.entity2idx,
+                    fault_nodes=fault_nodes,
+                    top_k=min(5, len(fault_nodes)),
                 )
-                loss.backward()
-                optimizer.step()
-                total_loss += loss.item()
-            logger.info("Epoch %d | loss=%.4f", epoch, total_loss)
+                logger.info("=" * 50)
+                logger.info("  Top-K 故障诊断结果")
+                logger.info("  输入症状: %s", ", ".join(symptoms))
+                for rank, (fault, score) in enumerate(results, start=1):
+                    logger.info("  %d. %-30s similarity=%.4f", rank, fault, score)
+                logger.info("=" * 50)
+            except ValueError as e:
+                logger.warning("推理失败: %s", e)
+
+        # 保存模型
+        if args.model_save:
+            pipeline.save_model(args.model_save)
 
     else:
-        # ========== 模式 C: 流式"边查边训" ==========
-        logger.info("模式 C: 流式模式 → 异步子图采样 + 边查边训")
+        # ========== 模式 C: 流式模式 → 先建全图再训练推理 ==========
+        logger.info("模式 C: 流式模式 → 全量构建图 + GCN 训练 + 推理")
 
-        sampler = AsyncSubgraphSampler(
+        # Phase 2: 流式构建全图 edge_index
+        logger.info("Phase 2: 流式构建全图 (search_after 逐批加载)...")
+        adapter = KGNeighborLoaderAdapter.from_streamer(
             streamer=streamer,
             vocab=vocab,
-            num_hops=2,
-            max_neighbors_per_hop=100,
-            prefetch_size=args.prefetch,
             head_field=args.head_field,
             relation_field=args.relation_field,
             tail_field=args.tail_field,
         )
+        data = adapter.data
 
-        # 模拟种子节点批次（实际场景中由业务 Sampler 产生）
-        sample_entities = list(vocab.entity2idx.keys())[:200]
-        seed_batches = [
-            sample_entities[i:i + 32]
-            for i in range(0, len(sample_entities), 32)
-        ]
+        # Phase 3: 构建故障标签
+        logger.info("Phase 3: 识别故障节点并构建标签 ...")
+        label_builder = FaultLabelBuilder(
+            vocab=vocab,
+            fault_relations=args.fault_relations,
+            fault_tails=args.fault_tails,
+        )
+        y, fault_nodes = label_builder.build_from_streamer(
+            streamer=streamer,
+            head_field=args.head_field,
+            relation_field=args.relation_field,
+            tail_field=args.tail_field,
+            extra_filters=extra_filters,
+        )
+        data.y = y
 
-        from kg_fault_diagnosis import FaultGCN
-
-        model = FaultGCN(in_dim=64, hidden_dim=32)
-        optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
-
-        logger.info("开始训练 (流式 边查边训 模式)...")
-        for epoch in range(args.epochs):
-            model.train()
-            batch_count = 0
-
-            for seeds, subgraph in sampler.iter_subgraphs_async(seed_batches):
-                if subgraph is None:
-                    continue
-
-                batch_count += 1
-                optimizer.zero_grad()
-                logits = model(subgraph)
-                loss = torch.nn.functional.cross_entropy(
-                    logits,
-                    torch.zeros(subgraph["entity"].num_nodes, dtype=torch.long),
-                )
-                loss.backward()
-                optimizer.step()
-
-            logger.info(
-                "Epoch %d | batches=%d | entities=%d | relations=%d",
-                epoch,
-                batch_count,
-                vocab.num_entities,
-                vocab.num_relations,
+        if not fault_nodes:
+            logger.error(
+                "未识别到任何故障节点，无法训练。"
+                "请通过 --fault-relations / --fault-tails 指定正确的故障分类关系。"
             )
+            return
 
-        sampler.shutdown()
-        logger.info("流式训练完成")
+        # Phase 4: 划分 train/val/test
+        from kg_fault_diagnosis import split_masks
+        data.train_mask, data.val_mask, data.test_mask = split_masks(data["entity"].num_nodes)
+        logger.info(
+            "数据集划分: train=%d, val=%d, test=%d",
+            data.train_mask.sum().item(),
+            data.val_mask.sum().item(),
+            data.test_mask.sum().item(),
+        )
+
+        # Phase 5: 训练
+        logger.info("Phase 4: GCN 训练 (epochs=%d) ...", args.gcn_epochs)
+        pipeline = KGTrainInferPipeline(in_dim=adapter.embedding_dim, hidden_dim=32)
+        history = pipeline.train_full_graph(
+            data=data,
+            y=y,
+            train_mask=data.train_mask,
+            val_mask=data.val_mask,
+            epochs=args.gcn_epochs,
+            verbose=True,
+        )
+
+        # Phase 6: 评估
+        logger.info("Phase 5: 测试集评估 ...")
+        metrics = pipeline.evaluate(
+            data=data,
+            y=y,
+            test_mask=data.test_mask,
+            model=pipeline.model,
+        )
+        logger.info(
+            "测试集结果: Acc=%.4f, Prec=%.4f, Rec=%.4f, F1=%.4f",
+            metrics["accuracy"], metrics["precision"], metrics["recall"], metrics["f1"],
+        )
+
+        # Phase 7: 推理
+        if not args.no_infer and fault_nodes:
+            symptoms = args.symptoms
+            if symptoms is None:
+                all_entity_names = list(vocab.entity2idx.keys())
+                non_fault_set = set(all_entity_names) - set(fault_nodes)
+                symptoms = list(non_fault_set)[:3] if non_fault_set else all_entity_names[:2]
+                logger.info("未指定 --symptoms，自动选取示例: %s", symptoms)
+
+            logger.info("Phase 6: Top-K 故障诊断推理 ...")
+            try:
+                results = pipeline.infer_topk(
+                    model=pipeline.model,
+                    data=data,
+                    symptoms=symptoms,
+                    node_to_idx=vocab.entity2idx,
+                    fault_nodes=fault_nodes,
+                    top_k=min(5, len(fault_nodes)),
+                )
+                logger.info("=" * 50)
+                logger.info("  Top-K 故障诊断结果")
+                logger.info("  输入症状: %s", ", ".join(symptoms))
+                for rank, (fault, score) in enumerate(results, start=1):
+                    logger.info("  %d. %-30s similarity=%.4f", rank, fault, score)
+                logger.info("=" * 50)
+            except ValueError as e:
+                logger.warning("推理失败: %s", e)
+
+        # 保存模型
+        if args.model_save:
+            pipeline.save_model(args.model_save)
 
 
 if __name__ == "__main__":
