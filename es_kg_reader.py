@@ -2645,7 +2645,7 @@ def main() -> None:
     parser.add_argument("--tail-field", default="dstEntityId")
 
     parser.add_argument("--graph-id", default="986946166448234496", help="按 graphId 过滤（如 980044155496734720）")
-    parser.add_argument("--ontology-id", default="986946166448234496", help="关系类型 ontologyId")
+    parser.add_argument("--ontology-id", default="986943553283596288", help="关系类型 ontologyId")
 
     # ID→名称解析索引（对齐原 fetch_triples 三步逻辑）
     parser.add_argument("--entity-index", default="knowledge_entity_index", help="实体索引名称")
