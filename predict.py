@@ -383,7 +383,8 @@ class KGFaultModelHandler(ModelHandler):
             results = topk_fault_diagnosis(
                 gcn_model,
                 self.data,
-                self.dataset,
+                self.dataset.node_to_idx,
+                self.dataset.fault_nodes,
                 processed_input,
                 top_k=self.top_k,
             )
