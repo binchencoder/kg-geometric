@@ -10,7 +10,7 @@ from typing import Dict, List, Sequence, Tuple
 import torch
 import torch.nn.functional as F
 
-from ..model.gcn import FaultGCN
+from src.model.gcn import FaultGCN
 
 
 def topk_fault_diagnosis(

@@ -13,8 +13,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.data import Data, HeteroData
 
-from ..core.config import logger
-from ..model.gcn import FaultGCN
+from src.core.config import logger
+from src.model.gcn import FaultGCN
 
 
 class KGTrainInferPipeline:

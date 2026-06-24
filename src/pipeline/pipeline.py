@@ -10,11 +10,11 @@ from typing import Iterator, List, Optional
 import torch
 from torch_geometric.loader import NeighborLoader
 
-from ..core.config import logger
-from ..es.streamer import ESTripletStreamer
-from ..es.vocabulary import KGVocabulary
-from ..graph.loader import KGNeighborLoaderAdapter
-from ..graph.sampler import AsyncSubgraphSampler
+from src.core.config import logger
+from src.es.streamer import ESTripletStreamer
+from src.es.vocabulary import KGVocabulary
+from src.graph.loader import KGNeighborLoaderAdapter
+from src.graph.sampler import AsyncSubgraphSampler
 
 
 class StreamingTrainingPipeline:

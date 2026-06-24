@@ -107,7 +107,7 @@ class KGNeighborLoaderAdapter:
     ) -> "KGNeighborLoaderAdapter":
         """从 ESTripletStreamer 一键构建全图 + NeighborLoader 适配器。"""
         if vocab is None:
-            from ..es.vocabulary import KGVocabulary
+            from src.es.vocabulary import KGVocabulary
             vocab = KGVocabulary()
 
         edges: List[Tuple[int, int]] = []

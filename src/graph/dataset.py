@@ -12,8 +12,8 @@ from typing import Dict, List, Optional
 import torch
 from torch_geometric.data import Data
 
-from ..core.config import logger
-from ..core.types import Triple
+from src.core.config import logger
+from src.core.types import Triple
 
 
 class TripleToDatasetConverter:
@@ -123,7 +123,7 @@ def build_pipeline(
     TripleToDatasetConverter
         包含 node_to_idx, edge_index, x, y 等可直接用于 GCN 训练的属性。
     """
-    from ..es.reader import ESKnowledgeGraphReader
+    from src.es.reader import ESKnowledgeGraphReader
 
     reader = ESKnowledgeGraphReader()
     try:

@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Iterator, List, Optional, Set, Tuple, Union
 
 from elasticsearch import Elasticsearch
 
-from ..core.config import logger
+from src.core.config import logger
 
 if TYPE_CHECKING:
     from .resolver import IDNameResolver

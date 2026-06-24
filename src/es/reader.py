@@ -11,8 +11,8 @@ from typing import Dict, Iterator, List, Optional, Set, Tuple
 from elasticsearch import Elasticsearch
 from elasticsearch.helpers import scan
 
-from ..core.config import ESConfig, BatchProgress, logger
-from ..core.types import Triple
+from src.core.config import ESConfig, BatchProgress, logger
+from src.core.types import Triple
 from .client import (
     create_es_client,
     ping_es,

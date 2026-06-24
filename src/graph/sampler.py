@@ -14,12 +14,12 @@ import numpy as np
 import torch
 from torch_geometric.data import HeteroData
 
-from ..core.config import logger
+from src.core.config import logger
 
 if TYPE_CHECKING:
-    from ..es.resolver import IDNameResolver
-    from ..es.streamer import ESTripletStreamer
-    from ..es.vocabulary import KGVocabulary
+    from src.es.resolver import IDNameResolver
+    from src.es.streamer import ESTripletStreamer
+    from src.es.vocabulary import KGVocabulary
 
 
 class AsyncSubgraphSampler:

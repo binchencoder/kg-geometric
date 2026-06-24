@@ -9,7 +9,7 @@ import json
 from pathlib import Path
 from typing import Dict, Optional
 
-from ..core.config import logger
+from src.core.config import logger
 
 
 class KGVocabulary:

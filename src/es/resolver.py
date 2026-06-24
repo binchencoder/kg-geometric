@@ -11,7 +11,7 @@ from typing import Dict, Iterator, List, Optional, Set, Tuple
 from elasticsearch import Elasticsearch
 from elasticsearch.helpers import scan
 
-from ..core.config import logger
+from src.core.config import logger
 
 
 class IDNameResolver:

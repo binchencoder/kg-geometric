@@ -10,7 +10,7 @@ from typing import Dict, List
 
 import torch
 
-from ..core.types import Triple
+from src.core.types import Triple
 
 
 class KGFaultDataset:

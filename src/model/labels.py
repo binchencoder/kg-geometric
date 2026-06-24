@@ -10,11 +10,11 @@ from typing import TYPE_CHECKING, List, Optional, Set, Tuple
 
 import torch
 
-from ..core.config import logger
+from src.core.config import logger
 
 if TYPE_CHECKING:
-    from ..es.streamer import ESTripletStreamer
-    from ..es.vocabulary import KGVocabulary
+    from src.es.streamer import ESTripletStreamer
+    from src.es.vocabulary import KGVocabulary
 
 
 class FaultLabelBuilder:

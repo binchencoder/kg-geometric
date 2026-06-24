@@ -10,7 +10,7 @@ from typing import List, Optional
 
 from elasticsearch import Elasticsearch
 
-from ..core.config import ESConfig, logger
+from src.core.config import ESConfig, logger
 
 
 def create_es_client(config: Optional[ESConfig] = None) -> Elasticsearch:
