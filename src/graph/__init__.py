@@ -5,10 +5,13 @@
 - KGFaultDataset: 内置小型示例故障知识图谱
 - AsyncSubgraphSampler: 基于 ES 的异步子图采样器
 - KGNeighborLoaderAdapter: PyG NeighborLoader 适配器
+- LinkPredictionData: 链接预测数据集（全量模式，边划分 + 负采样）
+- LinkPredictionStreamingData: 流式链接预测数据集（海量三元组，边查边训）
 """
 
 from .dataset import TripleToDatasetConverter, build_pipeline
 from .demo import KGFaultDataset
+from .link_prediction_dataset import LinkPredictionData, LinkPredictionStreamingData
 from .loader import KGNeighborLoaderAdapter
 from .sampler import AsyncSubgraphSampler
 
@@ -18,4 +21,6 @@ __all__ = [
     "KGFaultDataset",
     "KGNeighborLoaderAdapter",
     "AsyncSubgraphSampler",
+    "LinkPredictionData",
+    "LinkPredictionStreamingData",
 ]
