@@ -13,7 +13,7 @@ import torch
 from src.core.types import Triple
 
 
-class KGFaultDataset:
+class KGFaultDemoDataset:
     """小型工业故障知识图谱，包含 13 条三元组。
 
     覆盖泵、电机、齿轮箱、压缩机的常见故障模式。

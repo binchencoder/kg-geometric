@@ -37,7 +37,7 @@ import torch
 
 from src.core.config import ESConfig, logger
 from src.core.types import Triple
-from src.graph.link_prediction_dataset import LinkPredictionData, LinkPredictionStreamingData
+from src.dataset.link_prediction import LinkPredictionData, LinkPredictionStreamingData
 from src.model import (
     LinkPredictionGCN,
     train_link_prediction,

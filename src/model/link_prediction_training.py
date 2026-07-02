@@ -24,7 +24,7 @@ from .link_prediction import LinkPredictionGCN
 
 if TYPE_CHECKING:
     from src.graph.sampler import AsyncSubgraphSampler
-    from src.graph.link_prediction_dataset import LinkPredictionStreamingData
+    from src.dataset.link_prediction import LinkPredictionStreamingData
 
 # ---------- 训练 ----------
 
