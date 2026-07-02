@@ -80,11 +80,12 @@ class ESKnowledgeGraphReader:
     # ---- 核心：从 ES 批量读取并构建三元组 ----
     def fetch_triples(
             self,
+            graph_id: str,
+            ontology_id: str,
+            batch_size: int = 5000,
             entity_index: str = "knowledge_entity_index",
             relation_index: str = "knowledge_entity_relation_index",
             relation_type_index: str = "knowledge_entity_type_relation_index",
-            batch_size: int = 5000,
-            query: Optional[dict] = None,
             entity_id_field: str = "entityId",
             entity_name_field: str = "name",
             head_id_field: str = "srcEntityId",
@@ -102,16 +103,18 @@ class ESKnowledgeGraphReader:
 
         Parameters
         ----------
+        graph_id: str
+            图谱 ID。
+        ontology_id: str
+            本体 ID。
+        batch_size : int
+            scan 每批文档数。
         entity_index : str
             实体索引名称。
         relation_index : str
             关系索引名称。
         relation_type_index : str
             关系类型索引名称，用于将 relation_field 的 id 映射为可读名称。
-        batch_size : int
-            scan 每批文档数。
-        query : Optional[dict]
-            额外的 ES 查询过滤条件。
         entity_id_field : str
             实体文档中的 ID 字段名。
         entity_name_field : str
@@ -134,25 +137,36 @@ class ESKnowledgeGraphReader:
         """
         logger.info("=" * 60)
         logger.info("开始从 ES 读取知识图谱数据...")
-        logger.info("实体索引: %s, 关系索引: %s, 关系类型索引: %s",
+        logger.info("实体索引: %s,  关系索引: %s,  关系类型索引: %s",
                     entity_index, relation_index, relation_type_index)
         logger.info("=" * 60)
 
+        _graph_query = {
+            "match": {
+                "graphId": graph_id,
+            }
+        }
+        _ontology_query = {
+            "match": {
+                "ontologyId": ontology_id,
+            }
+        }
         # Step 1: 读取所有实体，构建 ID -> Name 映射
         entity_map = self._load_entity_map(
             entity_index=entity_index,
             batch_size=batch_size,
-            query=query,
+            query=_graph_query,
             id_field=entity_id_field,
             name_field=entity_name_field,
         )
         logger.info("实体映射构建完成，共 %d 个实体", len(entity_map))
 
         # Step 2: 读取关系类型，构建 relationTypeId -> Name 映射
+
         relation_type_map = self._load_relation_type_map(
             relation_type_index=relation_type_index,
             batch_size=batch_size,
-            query=query,
+            query=_ontology_query,
             id_field=relation_type_id_field,
             name_field=relation_type_name_field,
         )
@@ -164,7 +178,7 @@ class ESKnowledgeGraphReader:
             entity_map=entity_map,
             relation_type_map=relation_type_map,
             batch_size=batch_size,
-            query=query,
+            query=_graph_query,
             head_id_field=head_id_field,
             tail_id_field=tail_id_field,
             relation_field=relation_field,
@@ -260,9 +274,7 @@ class ESKnowledgeGraphReader:
         """扫描实体索引，构建 ID->Name 映射。"""
         entity_map: Dict[str, str] = {}
         base_query = query or {
-            "match": {
-                "graphId": "980044155496734720"
-            }
+            "match_all": {}
         }
         count = 0
 

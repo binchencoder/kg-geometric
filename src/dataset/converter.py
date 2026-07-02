@@ -109,10 +109,12 @@ class TripleToDatasetConverter:
 
 
 def build_pipeline(
+         graph_id: str,
+        ontology_id: str,
+        batch_size: int = 5000,
         entity_index: str = "knowledge_entity_index",
         relation_index: str = "knowledge_entity_relation_index",
         relation_type_index: str = "knowledge_entity_type_relation_index",
-        batch_size: int = 5000,
         fault_nodes: Optional[List[str]] = None,
         **field_mapping,
 ) -> TripleToDatasetConverter:
@@ -128,6 +130,8 @@ def build_pipeline(
     reader = ESKnowledgeGraphReader()
     try:
         triples = reader.fetch_triples(
+            graph_id=graph_id,
+            ontology_id=ontology_id,
             entity_index=entity_index,
             relation_index=relation_index,
             relation_type_index=relation_type_index,

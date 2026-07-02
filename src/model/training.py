@@ -10,15 +10,15 @@
 from __future__ import annotations
 
 import random
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 import torch
 import torch.nn as nn
 from sklearn.metrics import accuracy_score, classification_report, f1_score
 
+from src.core.config import logger
 from .gcn import FaultGCN
 from .rgcn import FaultRGCN
-from src.core.config import logger
 
 
 def split_masks(
@@ -67,6 +67,51 @@ def split_masks(
         make_mask(indices[train_cut:val_cut]),
         make_mask(indices[val_cut:]),
     )
+
+
+def train_gcn(
+        model: FaultGCN,
+        data,
+        epochs: int = 200,
+        lr: float = 0.01,
+        weight_decay: float = 5e-4,
+        log_interval: int = 50,
+) -> None:
+    """标准 GCN 训练循环（非关系型，无早停）。
+
+    Parameters
+    ----------
+    model : FaultGCN
+        GCN 模型实例。
+    data : Data
+        包含 x, edge_index, y, train_mask, val_mask 的图数据。
+    epochs : int
+        训练轮数。
+    lr : float
+        学习率。
+    weight_decay : float
+        L2 正则化权重衰减。
+    log_interval : int
+        日志输出间隔。
+    """
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    criterion = nn.CrossEntropyLoss()
+
+    for epoch in range(1, epochs + 1):
+        model.train()
+        optimizer.zero_grad()
+        logits = model(data)
+        loss = criterion(logits[data.train_mask], data.y[data.train_mask])
+        loss.backward()
+        optimizer.step()
+
+        if epoch % log_interval == 0:
+            model.eval()
+            with torch.no_grad():
+                pred = model(data).argmax(dim=1)
+                val_bool = pred[data.val_mask] == data.y[data.val_mask]
+                val_acc = val_bool.float().mean().item()
+            print(f"Epoch {epoch:03d} | loss={loss.item():.4f} | val_acc={val_acc:.3f}")
 
 
 def train_rgcn(
@@ -233,24 +278,7 @@ def train(
         return
 
     # 标准 GCN 训练路径（原逻辑）
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-    criterion = nn.CrossEntropyLoss()
-
-    for epoch in range(1, epochs + 1):
-        model.train()
-        optimizer.zero_grad()
-        logits = model(data)
-        loss = criterion(logits[data.train_mask], data.y[data.train_mask])
-        loss.backward()
-        optimizer.step()
-
-        if epoch % log_interval == 0:
-            model.eval()
-            with torch.no_grad():
-                pred = model(data).argmax(dim=1)
-                val_bool = pred[data.val_mask] == data.y[data.val_mask]
-                val_acc = val_bool.float().mean().item()
-            print(f"Epoch {epoch:03d} | loss={loss.item():.4f} | val_acc={val_acc:.3f}")
+    train_gcn(model, data, epochs, lr, weight_decay, log_interval)
 
 
 def evaluate(model: nn.Module, data) -> dict:
@@ -284,20 +312,30 @@ def evaluate(model: nn.Module, data) -> dict:
     acc = float(accuracy_score(test_true, test_pred))
     f1 = float(f1_score(test_true, test_pred, zero_division=0))
 
-    print(f"\n{'='*50}")
+    unique_classes = sorted(set(test_true.tolist()) | set(test_pred.tolist()))
+    class_names = [f"class_{c}" for c in unique_classes]
+    if len(unique_classes) == 1:
+        # 单类场景（整图训练）跳过分类报告
+        class_names = ["all"]
+        labels = unique_classes
+    else:
+        labels = unique_classes
+
+    print(f"\n{'=' * 50}")
     print("  测试集评估结果")
-    print(f"{'='*50}")
+    print(f"{'=' * 50}")
     print(f"  Accuracy : {acc:.4f}")
     print(f"  F1 Score : {f1:.4f}")
-    print(f"{'='*50}")
-    print(
-        classification_report(
-            test_true,
-            test_pred,
-            target_names=["normal", "fault"],
-            zero_division=0,
+    print(f"{'=' * 50}")
+    if len(unique_classes) > 1:
+        print(
+            classification_report(
+                test_true, test_pred,
+                target_names=class_names,
+                labels=labels,
+                zero_division=0,
+            )
         )
-    )
 
     from sklearn.metrics import precision_score, recall_score
     return {

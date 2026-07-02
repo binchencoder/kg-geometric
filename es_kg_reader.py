@@ -95,6 +95,8 @@ def _run_legacy_mode(args) -> None:
         logger.info("发现索引: %s", reader.list_indices())
 
         triples = reader.fetch_triples(
+            graph_id=args.graph_id,
+            ontology_id=args.ontology_id,
             entity_index="knowledge_entity_index",
             relation_index="knowledge_entity_relation_index",
             relation_type_index="knowledge_entity_type_relation_index",

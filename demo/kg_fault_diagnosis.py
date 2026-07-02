@@ -222,7 +222,7 @@ def main() -> None:
   python demo/kg_fault_diagnosis.py --query "水温表" --epochs 500
         """,
     )
-    parser.add_argument("--query", default=None,
+    parser.add_argument("--query", default="手刹拉不动",
                         help="输入症状文本（默认使用示例症状）")
     parser.add_argument("--top-k", type=int, default=3,
                         help="故障定位 Top-K (默认: 3)")
@@ -239,10 +239,11 @@ def main() -> None:
     # ---- 阶段 1: 加载数据集 ----
     print("\n📦 加载车辆故障知识图谱...")
     dataset = KGFaultDataset()
+    print(f"  数据源: {dataset._data_source}")
     print(f"  实体: {dataset.num_nodes}")
     print(f"  关系类型: {dataset.num_original_relations}")
     print(f"  三元组: {len(dataset.triples)}")
-    print(f"  故障原因节点: {len(dataset.fault_nodes)}")
+    print(f"  整图训练节点: {len(dataset.fault_nodes)}")
     print(f"  故障类别: {dataset.get_fault_category_nodes()}")
     print(f"  关系列表: {dataset.relation_list}")
 

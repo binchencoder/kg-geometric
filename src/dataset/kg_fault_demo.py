@@ -1,6 +1,6 @@
-"""内置示例知识图谱数据集 —— 车辆故障知识图谱。
+"""知识图谱数据集 —— 车辆故障知识图谱。
 
-基于 CVFFAD 中文车辆故障关联数据集结构构建，
+优先从 Elasticsearch 加载真实三元组数据，失败时回退到内置 CVFFAD 示例数据。
 包含故障现象、故障原因、维修措施、所需工具等多关系类型。
 
 支持 R-GCN 所需的关系类型索引和图遍历查询。
@@ -9,33 +9,185 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
+from src.core.config import logger
 from src.core.types import Triple
 
 
 class KGFaultDataset:
     """车辆故障知识图谱数据集。
 
-    关系类型:
-    - "表现为"    : Fault → Symptom（故障的表现症状，正向）
-    - "由...引起" : Fault → Cause（故障的根本原因，正向）
-    - "维修措施"   : Fault → Action（修复措施，正向）
-    - "需要工具"   : Fault → Tool（维修所需工具，正向）
-    - "属于系统"   : Fault → System（所属车辆系统，正向）
-    - "属于类别"   : Fault → Category（故障分类，正向）
+    数据源优先级：ES 实时查询 → 内置 CVFFAD 示例数据。
+
+    Parameters
+    ----------
+    use_es : bool
+        是否从 Elasticsearch 加载三元组（默认 True）。失败时自动回退到内置数据。
+    es_entity_index : str
+        ES 实体索引名称。
+    es_relation_index : str
+        ES 关系索引名称。
+    es_relation_type_index : str
+        ES 关系类型索引名称。
+    es_batch_size : int
+        ES scan 批次大小。
+    es_query : Optional[dict]
+        额外的 ES 查询过滤条件（如按 graphId 过滤）。
+    es_head_field : str
+        关系文档中头实体 ID 字段名。
+    es_tail_field : str
+        关系文档中尾实体 ID 字段名。
+    es_relation_field : str
+        关系文档中关系类型 ID 字段名。
+    es_entity_id_field : str
+        实体文档中 ID 字段名。
+    es_entity_name_field : str
+        实体文档中名称字段名。
+    es_relation_type_id_field : str
+        关系类型文档中 ID 字段名。
+    es_relation_type_name_field : str
+        关系类型文档中名称字段名。
 
     图遍历 API:
-    - get_forward(head, relation) → List[tail] : 获取与 head 通过 relation 相连的所有 tail
-    - get_backward(tail, relation) → List[head] : 获取通过 relation 指向 tail 的所有 head
-    - get_symptom_nodes() → List[str] : 获取所有症状描述节点
-    - get_fault_category_nodes() → List[str] : 获取所有故障类别节点（head 节点）
+    - get_forward(head, relation) → List[tail]
+    - get_backward(tail, relation) → List[head]
+    - get_symptom_nodes() → List[str]
+    - get_fault_category_nodes() → List[str]
     """
 
-    def __init__(self) -> None:
-        self.triples: List[Triple] = [
+    def __init__(
+            self,
+            graph_id: str = "992504969637961728",
+            ontology_id: str = "992355151124930560",
+            use_es: bool = True,
+            es_entity_index: str = "knowledge_entity_index",
+            es_relation_index: str = "knowledge_entity_relation_index",
+            es_relation_type_index: str = "knowledge_entity_type_relation_index",
+            es_batch_size: int = 5000,
+            es_head_field: str = "srcEntityId",
+            es_relation_field: str = "relationTypeId",
+            es_tail_field: str = "dstEntityId",
+            es_entity_id_field: str = "entityId",
+            es_entity_name_field: str = "name",
+            es_relation_type_id_field: str = "relationTypeId",
+            es_relation_type_name_field: str = "name",
+    ) -> None:
+        if use_es:
+            try:
+                self.triples = self._load_from_es(
+                    graph_id=graph_id,
+                    ontology_id=ontology_id,
+                    entity_index=es_entity_index,
+                    relation_index=es_relation_index,
+                    relation_type_index=es_relation_type_index,
+                    batch_size=es_batch_size,
+                    head_field=es_head_field,
+                    relation_field=es_relation_field,
+                    tail_field=es_tail_field,
+                    entity_id_field=es_entity_id_field,
+                    entity_name_field=es_entity_name_field,
+                    relation_type_id_field=es_relation_type_id_field,
+                    relation_type_name_field=es_relation_type_name_field,
+                )
+                self._data_source = "elasticsearch"
+                logger.info("从 ES 加载三元组完成: %d 条", len(self.triples))
+            except Exception as e:
+                logger.warning("从 ES 加载失败 (%s)，回退到内置示例数据", e)
+                self.triples = self._hardcoded_triples()
+                self._data_source = "builtin"
+        else:
+            self.triples = self._hardcoded_triples()
+            self._data_source = "builtin"
+
+        # ---- 1. 构建节点词汇表 ----
+        self.node_to_idx = self._build_vocab()
+        self.idx_to_node = {idx: node for node, idx in self.node_to_idx.items()}
+
+        # ---- 2. 构建关系词汇表 ----
+        self._build_relation_vocab()
+
+        # ---- 3. 构建边索引和边类型（用于 R-GCN） ----
+        self.edge_index, self.edge_type = self._build_rgcn_edges()
+
+        # ---- 4. 构建图遍历映射（用于推理管线） ----
+        self._build_traversal_maps()
+
+        # ---- 5. 构建标签 ----
+        # 整图训练：所有节点平等参与，不指定故障节点类型
+        all_nodes = {t.head for t in self.triples} | {t.tail for t in self.triples}
+        self.fault_nodes = sorted(all_nodes)
+        self.labels: Dict[str, int] = {
+            node: 1 for node in all_nodes
+        }
+
+        # ---- 6. 构建特征和标签张量 ----
+        self.num_nodes = len(self.node_to_idx)
+        self.x = torch.eye(self.num_nodes, dtype=torch.float)
+        ordered_nodes = [self.idx_to_node[i] for i in range(self.num_nodes)]
+        self.y = torch.tensor(
+            [self.labels[node] for node in ordered_nodes], dtype=torch.long
+        )
+
+    # ================================================================
+    # 数据加载
+    # ================================================================
+
+    @staticmethod
+    def _load_from_es(
+            graph_id: str,
+            ontology_id: str,
+            batch_size: int = 5000,
+            entity_index: str = "knowledge_entity_index",
+            relation_index: str = "knowledge_entity_relation_index",
+            relation_type_index: str = "knowledge_entity_type_relation_index",
+            query: Optional[dict] = None,
+            head_field: str = "srcEntityId",
+            relation_field: str = "relationTypeId",
+            tail_field: str = "dstEntityId",
+            entity_id_field: str = "entityId",
+            entity_name_field: str = "name",
+            relation_type_id_field: str = "relationTypeId",
+            relation_type_name_field: str = "name",
+    ) -> List[Triple]:
+        """从 Elasticsearch 加载三元组。
+
+        使用 ESKnowledgeGraphReader 三步查询法：
+        1. 读取实体索引 → entityId → name 映射
+        2. 读取关系类型索引 → relationTypeId → name 映射
+        3. 读取关系索引 → 解析为 Triple 列表
+        """
+        from src.es.reader import ESKnowledgeGraphReader
+
+        reader = ESKnowledgeGraphReader()
+        try:
+            triples = reader.fetch_triples(
+                graph_id=graph_id,
+                ontology_id=ontology_id,
+                batch_size=batch_size,
+                entity_index=entity_index,
+                relation_index=relation_index,
+                relation_type_index=relation_type_index,
+                entity_id_field=entity_id_field,
+                entity_name_field=entity_name_field,
+                head_id_field=head_field,
+                tail_id_field=tail_field,
+                relation_field=relation_field,
+                relation_type_id_field=relation_type_id_field,
+                relation_type_name_field=relation_type_name_field,
+            )
+            if not triples:
+                raise ValueError("ES 查询结果为空（无三元组）")
+            return triples
+        finally:
+            reader.close()
+
+    @staticmethod
+    def _hardcoded_triples() -> List[Triple]:
+        """内置 CVFFAD 示例三元组（用于离线/单测/ES 不可用时的回退）。"""
+        return [
             # ================================================================
             # 发动机启动困难
             # ================================================================
@@ -157,38 +309,6 @@ class KGFaultDataset:
             Triple("变速箱换挡顿挫", "表现为", "换挡时车身明显闯动"),
             Triple("变速箱换挡顿挫", "表现为", "自动变速箱升档延迟"),
         ]
-
-        # ---- 1. 构建节点词汇表 ----
-        self.node_to_idx = self._build_vocab()
-        self.idx_to_node = {idx: node for node, idx in self.node_to_idx.items()}
-
-        # ---- 2. 构建关系词汇表 ----
-        self._build_relation_vocab()
-
-        # ---- 3. 构建边索引和边类型（用于 R-GCN） ----
-        self.edge_index, self.edge_type = self._build_rgcn_edges()
-
-        # ---- 4. 构建图遍历映射（用于推理管线） ----
-        self._build_traversal_maps()
-
-        # ---- 5. 构建标签 ----
-        # 故障节点 = "由...引起" 关系的 tail（故障原因实体）
-        self.fault_nodes = [
-            t.tail for t in self.triples if t.relation == "由...引起"
-        ]
-        all_nodes = {t.head for t in self.triples} | {t.tail for t in self.triples}
-        fault_set = set(self.fault_nodes)
-        self.labels: Dict[str, int] = {
-            node: (1 if node in fault_set else 0) for node in all_nodes
-        }
-
-        # ---- 6. 构建特征和标签张量 ----
-        self.num_nodes = len(self.node_to_idx)
-        self.x = torch.eye(self.num_nodes, dtype=torch.float)
-        ordered_nodes = [self.idx_to_node[i] for i in range(self.num_nodes)]
-        self.y = torch.tensor(
-            [self.labels[node] for node in ordered_nodes], dtype=torch.long
-        )
 
     # ================================================================
     # 构建方法
