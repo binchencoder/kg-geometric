@@ -74,8 +74,8 @@ def _parse_args():
 
     # ── 数据源 ──
     parser.add_argument(
-        "--mode", choices=["demo", "es", "streaming"], default="streaming",
-        help="数据源模式: demo=内置示例 | es=ES全量加载 | streaming=ES流式子图采样 (default: streaming)",
+        "--mode", choices=["es", "streaming"], default="streaming",
+        help="数据源模式: es=ES全量加载 | streaming=ES流式子图采样 (default: streaming)",
     )
     parser.add_argument(
         "--index", default=["knowledge_entity_relation_index"], nargs="+",
@@ -149,7 +149,7 @@ def _parse_args():
     # ── 推理参数 ──
     parser.add_argument("--top-k", type=int, default=3,
                         help="链接预测推理时返回的 Top-K 候选数")
-    parser.add_argument("--query-head", nargs="+", default=["李浩然"],
+    parser.add_argument("--query-head", nargs="+", default=["李一诺"],
                         help="推理时指定的查询头实体名称，多个用空格分隔")
     parser.add_argument("--query-rel", nargs="+", default=["具有"],
                         help="推理时指定的查询关系名称，多个用空格分隔")
@@ -469,71 +469,6 @@ def _run_inference_queries_streaming(
 
 
 # -------------------- 主流程 --------------------
-
-
-def _run_demo_mode(args):
-    """内置 Demo 模式 —— 全图训练。"""
-    print("\n使用内置工业故障知识图谱示例数据...")
-    triples = _load_triples_demo()
-
-    print("\n构建链接预测数据集 (边划分 80%/10%/10%)...")
-    lp_data = LinkPredictionData(triples, split_ratios=(0.8, 0.1, 0.1), seed=42)
-
-    print("\n数据集统计:")
-    for k, v in lp_data.statistics().items():
-        print(f"  {k}: {v}")
-
-    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    model = LinkPredictionGCN(
-        in_dim=lp_data.num_nodes,
-        hidden_dim=args.hidden_dim,
-        num_relations=lp_data.num_relations,
-        dropout=0.2,
-    )
-    print(f"\n模型架构:\n{model}")
-    print(f"设备: {device}")
-
-    print("\n" + "-" * 40)
-    print("开始训练链接预测模型 (全图模式)...")
-    print("-" * 40)
-
-    model = train_link_prediction(
-        model=model,
-        data=lp_data.data,
-        train_edges=lp_data.train_edges,
-        val_edges=lp_data.val_edges,
-        all_triples_set=lp_data._all_triples_set,
-        num_nodes=lp_data.num_nodes,
-        epochs=args.epochs,
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-        batch_size=min(args.batch_size_train, len(lp_data.train_edges)),
-        num_negatives=args.num_negatives,
-        log_interval=args.log_interval,
-        device=device,
-    )
-
-    print("\n" + "-" * 40)
-    print("测试集评估...")
-    print("-" * 40)
-
-    metrics = evaluate_link_prediction(
-        model=model,
-        data=lp_data.data,
-        test_edges=lp_data.test_edges,
-        all_triples_set=lp_data._all_triples_set,
-        num_nodes=lp_data.num_nodes,
-        device=device,
-    )
-
-    print("\n链接预测评估结果:")
-    print(f"  MRR:       {metrics['mrr']:.4f}")
-    print(f"  Hits@1:    {metrics['hits@1']:.3f}")
-    print(f"  Hits@3:    {metrics['hits@3']:.3f}")
-    print(f"  Hits@10:   {metrics['hits@10']:.3f}")
-
-    _run_inference_queries_full(model, lp_data, device, args)
-
 
 def _run_es_mode(args):
     """ES 全量模式 —— 加载全部三元组后全图训练。"""

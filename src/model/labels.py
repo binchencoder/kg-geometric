@@ -1,7 +1,7 @@
 """故障标签构建器 —— 从知识图谱中自动识别故障节点并生成训练标签。
 
-识别策略基于关系模式匹配：查找 (实体 --关系类型--> 尾实体) 中
-relation ∈ fault_relations 且 tail ∈ fault_tails 的实体，标记为故障节点。
+识别策略：当 relation ∈ fault_relations 时，收集 tail 实体作为故障节点。
+与 kg_fault_demo.py 逻辑一致（如 "由...引起" 关系 → tail 即为故障原因）。
 """
 
 from __future__ import annotations
@@ -20,24 +20,21 @@ if TYPE_CHECKING:
 class FaultLabelBuilder:
     """从已解析的知识图谱中自动识别故障节点并构建训练标签。
 
-    识别策略：
-    1. 基于关系模式匹配：查找 (实体 --关系类型--> 尾实体) 中
-       relation ∈ fault_relations 且 tail ∈ fault_tails 的实体，
-       将其标记为故障节点。
-    2. 默认匹配："类型为" → "故障" 模式，覆盖常见工业故障分类。
+    识别策略：当 relation ∈ fault_relations 时，收集 tail 实体作为故障节点。
+    例如：
+    - "由...引起" 关系 → tail 为故障原因
+    - "类型为" 关系   → tail 为故障类别
     """
 
     DEFAULT_FAULT_RELATIONS = [
-        "类型为", "type", "rdf:type", "类别为", "分类为",
-        "is_fault", "故障类型", "fault_type",
+        "由...引起", "原因在于", "类型为", "type", "类别为", "分类为",
+        "故障类型", "fault_type", "发生故障",
     ]
-    DEFAULT_FAULT_TAILS = ["故障", "fault", "Failure", "异常", "失效"]
 
     def __init__(
             self,
             vocab: "KGVocabulary",
             fault_relations: Optional[List[str]] = None,
-            fault_tails: Optional[List[str]] = None,
     ):
         """
         Parameters
@@ -45,13 +42,11 @@ class FaultLabelBuilder:
         vocab : KGVocabulary
             全局词汇表，已包含所有实体和关系类型。
         fault_relations : Optional[List[str]]
-            指示故障分类的关系名称列表。
-        fault_tails : Optional[List[str]]
-            故障类别的尾实体名称列表。
+            指向故障原因的关系名称列表，如 ["由...引起", "原因在于"]。
+            默认包含 "由...引起" / "类型为" 等常见关系。
         """
         self.vocab = vocab
         self.fault_relations = fault_relations or self.DEFAULT_FAULT_RELATIONS
-        self.fault_tails = fault_tails or self.DEFAULT_FAULT_TAILS
 
         self.fault_nodes: List[str] = []
         self.y: Optional[torch.Tensor] = None
@@ -67,8 +62,8 @@ class FaultLabelBuilder:
     ) -> Tuple[torch.Tensor, List[str]]:
         """全量扫描三元组，根据关系模式识别故障节点。
 
-        遍历所有三元组，当 relation ∈ fault_relations 且 tail ∈ fault_tails 时，
-        将 head 实体标记为故障节点。
+        与 kg_fault_demo.py 一致：当 relation ∈ fault_relations 时，
+        将 tail 实体收集为故障节点（故障原因）。
 
         Returns
         -------
@@ -76,7 +71,6 @@ class FaultLabelBuilder:
             (y: 标签张量 [num_entities], fault_nodes: 故障节点名称列表)
         """
         _fault_relation_set = set(self.fault_relations)
-        _fault_tail_set = set(self.fault_tails)
         fault_set: Set[str] = set()
 
         total_scanned = 0
@@ -90,9 +84,9 @@ class FaultLabelBuilder:
         ):
             for t in batch:
                 head, rel, tail = t["head"], t["relation"], t["tail"]
-                if rel in _fault_relation_set and tail in _fault_tail_set:
-                    if head in self.vocab.entity2idx:
-                        fault_set.add(head)
+                if rel in _fault_relation_set:
+                    if tail in self.vocab.entity2idx:
+                        fault_set.add(tail)
                 total_scanned += 1
 
         self.fault_nodes = sorted(fault_set)
@@ -114,9 +108,9 @@ class FaultLabelBuilder:
         )
         if fault_count == 0:
             logger.warning(
-                "未识别到任何故障节点！请检查 fault_relations=%s 和 fault_tails=%s "
-                "是否与知识图谱中的实际关系/尾实体匹配",
-                self.fault_relations, self.fault_tails,
+                "未识别到任何故障节点！请检查 fault_relations=%s "
+                "是否与知识图谱中的实际关系匹配",
+                self.fault_relations,
             )
 
         return self.y, self.fault_nodes

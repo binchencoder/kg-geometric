@@ -21,7 +21,7 @@ import torch
 from src.model.gcn import FaultGCN
 from src.model.training import split_masks, train, evaluate
 from src.pipeline.diagnosis import topk_fault_diagnosis, print_topk_diagnosis
-from src.graph.demo import KGFaultDataset
+from src.graph.kg_fault_demo import KGFaultDataset
 
 SEED = 42
 random.seed(SEED)
@@ -52,12 +52,12 @@ def main() -> None:
     train(model, data)
     evaluate(model, data)
 
-    example_symptoms = ["振动过高", "温度过高"]
+    example_symptoms = ["启动时有吱吱异响"]
     results = topk_fault_diagnosis(model, data, dataset.node_to_idx,
                                    dataset.fault_nodes, example_symptoms, top_k=3)
     print_topk_diagnosis(results, example_symptoms)
 
-    example_symptoms_2 = ["电流过高"]
+    example_symptoms_2 = ["暖风不热"]
     results_2 = topk_fault_diagnosis(model, data, dataset.node_to_idx,
                                      dataset.fault_nodes, example_symptoms_2, top_k=3)
     print_topk_diagnosis(results_2, example_symptoms_2)

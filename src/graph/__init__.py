@@ -10,7 +10,7 @@
 """
 
 from .dataset import TripleToDatasetConverter, build_pipeline
-from .demo import KGFaultDataset
+from .kg_fault_demo import KGFaultDataset
 from .link_prediction_dataset import LinkPredictionData, LinkPredictionStreamingData
 from .loader import KGNeighborLoaderAdapter
 from .sampler import AsyncSubgraphSampler

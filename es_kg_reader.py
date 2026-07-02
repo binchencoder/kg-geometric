@@ -32,6 +32,7 @@ from src import (
     StreamingTrainingPipeline, KGTrainInferPipeline, topk_fault_diagnosis,
 )
 
+
 # -------------------- 命令行参数解析 --------------------
 
 
@@ -55,8 +56,8 @@ def _parse_args():
     parser.add_argument("--relation-field", default="relationTypeId")
     parser.add_argument("--tail-field", default="dstEntityId")
 
-    parser.add_argument("--graph-id", default="986946166448234496", help="按 graphId 过滤（如 980044155496734720）")
-    parser.add_argument("--ontology-id", default="986943553283596288", help="关系类型 ontologyId")
+    parser.add_argument("--graph-id", default="992504969637961728", help="按 graphId 过滤（如 980044155496734720）")
+    parser.add_argument("--ontology-id", default="992355151124930560", help="关系类型 ontologyId")
 
     parser.add_argument("--entity-index", default="knowledge_entity_index", help="实体索引名称")
     parser.add_argument("--entity-id-field", default="entityId", help="实体索引中的 ID 字段名")
@@ -69,15 +70,14 @@ def _parse_args():
                         help="关系类型索引中的名称字段名（如 name / typeName / label）")
     parser.add_argument("--no-resolve", action="store_true", help="禁用 ID 到名称的解析（直接使用原始 ID）")
     parser.add_argument("--resolve-debug", action="store_true", help="启用解析器调试模式：采样索引文档并输出字段名")
+
     parser.add_argument("--fault-relations", nargs="+",
-                        default=["类型为", "type", "rdf:type", "类别为", "is_fault", "故障类型"],
+                        default=["类型为", "类别为", "is_fault", "故障类型", "由...引起"],
                         help="标识故障分类的关系名称列表")
-    parser.add_argument("--fault-tails", nargs="+",
-                        default=["故障", "fault", "Failure", "异常", "失效"],
-                        help="故障类目尾实体名称列表")
+
     parser.add_argument("--gcn-epochs", type=int, default=200, help="GCN 训练轮数")
     parser.add_argument("--no-infer", action="store_true", help="跳过推理阶段")
-    parser.add_argument("--symptoms", nargs="+", default=None,
+    parser.add_argument("--symptoms", nargs="+", default=["急加速时进气管有嘶嘶声"],
                         help="推理时输入的症状节点名称（多个用空格分隔）")
     parser.add_argument("--model-save", default="./models/kg_fault_model.pt", help="模型保存路径")
     return parser.parse_args()
@@ -197,7 +197,9 @@ def _build_resolver(args, config: ESConfig) -> IDNameResolver | None:
 
 
 def _build_vocabulary_and_streamer(
-    args, config: ESConfig, resolver: IDNameResolver | None
+        args,
+        config: ESConfig,
+        resolver: IDNameResolver | None
 ):
     """构建全局词汇表和 ESTripletStreamer。
 
@@ -265,8 +267,8 @@ def _auto_select_symptoms(vocab: KGVocabulary, fault_nodes: list[str]) -> list[s
 
 
 def _run_inference(
-    pipeline, data, vocab: KGVocabulary,
-    fault_nodes: list[str], symptoms: list[str],
+        pipeline, data, vocab: KGVocabulary,
+        fault_nodes: list[str], symptoms: list[str],
 ) -> None:
     """执行 Top-K 故障诊断推理并打印结果。"""
     logger.info("执行 Top-K 故障诊断推理 (symptoms=%s) ...", symptoms)
@@ -290,9 +292,11 @@ def _run_inference(
 
 
 def _run_stream_based_mode(
-    args, streamer: ESTripletStreamer,
-    vocab: KGVocabulary, extra_filters,
-    mode_label: str,
+        args,
+        streamer: ESTripletStreamer,
+        vocab: KGVocabulary,
+        extra_filters,
+        mode_label: str,
 ) -> None:
     """模式 B/C 公共逻辑：构建全图 → 训练 → 评估 → 推理。
 
@@ -317,7 +321,6 @@ def _run_stream_based_mode(
     label_builder = FaultLabelBuilder(
         vocab=vocab,
         fault_relations=args.fault_relations,
-        fault_tails=args.fault_tails,
     )
     y, fault_nodes = label_builder.build_from_streamer(
         streamer=streamer,
@@ -331,7 +334,7 @@ def _run_stream_based_mode(
     if not fault_nodes:
         logger.error(
             "未识别到任何故障节点，无法训练。"
-            "请通过 --fault-relations / --fault-tails 指定正确的故障分类关系。"
+            "请通过 --fault-relations 指定正确的故障分类关系。"
         )
         return
 

@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, Iterator, List, Optional, Set, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
 
 from elasticsearch import Elasticsearch
 from elasticsearch.helpers import scan
@@ -291,9 +291,7 @@ class ESKnowledgeGraphReader:
         """扫描关系类型索引，构建 relationTypeId -> Name 映射。"""
         relation_type_map: Dict[str, str] = {}
         base_query = query or {
-            "match": {
-                "ontologyId": "979748419706068992"
-            }
+            "match_all": {}
         }
         count = 0
 
@@ -330,9 +328,7 @@ class ESKnowledgeGraphReader:
         progress = BatchProgress()
         triples: List[Triple] = []
         base_query = query or {
-            "match": {
-                "graphId": "980044155496734720"
-            }
+            "match_all": {}
         }
         seen = set()
         unresolved_relations: set = set()

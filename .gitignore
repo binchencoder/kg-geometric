@@ -223,3 +223,4 @@ build
 /vocab_checkpoints
 /models
 .codebuddy
+/data
