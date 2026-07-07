@@ -32,56 +32,71 @@ HIDDEN_DIM = 32
 
 # ===================== 1. 数据加载与标签生成 =====================
 def load_and_preprocess_dataset(csv_path):
-    """加载变压器时序数据，生成健康状态标签"""
-    df = pd.read_csv(csv_path)
-    # 时间格式处理
-    df["date"] = pd.to_datetime(df["date"])
-    # 特征标准化
-    df[FEATURE_LIST] = (df[FEATURE_LIST] - df[FEATURE_LIST].mean()) / df[FEATURE_LIST].std()
+    """加载变压器时序数据，生成健康状态标签；返回 (标准化后的df, 原始值df, 特征mean, 特征std)
 
-    # 生成健康状态标签（电力行业规则）
+    - 标准化仅用于训练特征 (FEATURE_LIST)；标签 (health_label / future_OT) 与原始值保持一致。
+    - 返回的原始值 df 用于后续展示/对比。
+    """
+    df_raw = pd.read_csv(csv_path)
+    df_raw["date"] = pd.to_datetime(df_raw["date"])
+
+    # 先在原始值上生成健康状态标签（使用真实阈值：40℃、50℃）
     health_labels = []
-    for _, row in df.iterrows():
+    for _, row in df_raw.iterrows():
         ot = row["OT"]
         hufl = row["HUFL"]
         mufl = row["MUFL"]
         lufl = row["LUFL"]
-
-        # 过载故障：主负载超过阈值，油温快速上升
         if hufl > 20 or mufl > 18 or lufl > 10:
             health_labels.append(3)
-        # 严重过热：油温≥50℃
         elif ot >= 50:
             health_labels.append(2)
-        # 轻微过热：40℃≤油温<50℃
         elif ot >= 40:
             health_labels.append(1)
-        # 正常运行
         else:
             health_labels.append(0)
 
-    df["health_label"] = health_labels
-    # 生成未来3步油温预测标签（趋势预测）
-    df["future_OT"] = df["OT"].shift(-3)
-    df = df.dropna()
-    return df
+    # 先在原始值上计算 future_OT（使用真实摄氏度，而不是 z-score）
+    df_raw["health_label"] = health_labels
+    df_raw["future_OT"] = df_raw["OT"].shift(-3)
+
+    # 复制一份用于训练：仅对 FEATURE_LIST 做标准化
+    feat_mean = df_raw[FEATURE_LIST].mean().values.astype(np.float32)
+    feat_std = df_raw[FEATURE_LIST].std().values.astype(np.float32)
+    df_train = df_raw.copy()
+    df_train[FEATURE_LIST] = (df_train[FEATURE_LIST] - feat_mean) / feat_std
+
+    # 丢弃 NA 行保持一致
+    df_train = df_train.dropna().reset_index(drop=True)
+    df_raw = df_raw.dropna().reset_index(drop=True)
+    return df_train, df_raw, feat_mean, feat_std
 
 
 # ===================== 2. 构建电力变压器时序异构图知识图谱 =====================
-def build_transformer_kg(df, transformer_id=0):
+def build_transformer_kg(df_train, df_raw, feat_mean, feat_std, transformer_id=0):
+    """构建异构图知识图谱。
+
+    - df_train: 特征已标准化的 DataFrame，用于模型输入 (x)
+    - df_raw:  原始值 DataFrame，用于展示 (x_raw, 真实油温)
+    - feat_mean / feat_std: 用于对预测结果反归一化
+    """
     data = HeteroData()
-    slice_num = len(df)
+    slice_num = len(df_train)
 
     # 1. 节点1：transformer 电力变压器
-    data["transformer"].x = torch.tensor([[transformer_id, 2, 110]], dtype=torch.float32)  # 编号、年限、电压等级
+    data["transformer"].x = torch.tensor([[transformer_id, 2, 110]], dtype=torch.float32)
 
     # 2. 节点2：time_slice 时序运行切片
-    data["time_slice"].x = torch.tensor(df[FEATURE_LIST].values, dtype=torch.float32)
-    data["time_slice"].y_health = torch.tensor(df["health_label"].values, dtype=torch.long)
-    data["time_slice"].y_future_ot = torch.tensor(df["future_OT"].values, dtype=torch.float32)
-    # 顺序序号用于 TGN 时序编码，同时保存真实日期时间字符串用于展示
+    #    x：标准化特征（供模型训练）；x_raw：原始值（供展示）
+    data["time_slice"].x = torch.tensor(df_train[FEATURE_LIST].values, dtype=torch.float32)
+    data["time_slice"].x_raw = torch.tensor(df_raw[FEATURE_LIST].values, dtype=torch.float32)
+    data["time_slice"].y_health = torch.tensor(df_raw["health_label"].values, dtype=torch.long)
+    data["time_slice"].y_future_ot = torch.tensor(df_raw["future_OT"].values, dtype=torch.float32)
+    # 顺序序号用于 TGN 时序编码，同时保存真实日期时间字符串与反归一化统计量
     data["time_slice"].time = torch.tensor(np.arange(slice_num), dtype=torch.float32).unsqueeze(1)
-    data["time_slice"].date_str = df["date"].dt.strftime("%Y-%m-%d %H:%M:%S").tolist()
+    data["time_slice"].date_str = df_raw["date"].dt.strftime("%Y-%m-%d %H:%M:%S").tolist()
+    data["time_slice"].feat_mean = torch.tensor(feat_mean, dtype=torch.float32)
+    data["time_slice"].feat_std = torch.tensor(feat_std, dtype=torch.float32)
 
     # 3. 节点3：health_state 健康状态
     data["health_state"].x = torch.randn(HEALTH_NUM, 4)
@@ -98,7 +113,7 @@ def build_transformer_kg(df, transformer_id=0):
 
     # 构建边：time_slice -> has_health_state -> health_state
     slice2health = []
-    for slice_id, health_id in enumerate(df["health_label"].values):
+    for slice_id, health_id in enumerate(df_raw["health_label"].values):
         slice2health.append([slice_id, health_id])
     data["time_slice", "has_health_state", "health_state"].edge_index = torch.tensor(slice2health).T
 
@@ -299,12 +314,25 @@ class TGNOilTemperaturePredict(torch.nn.Module):
 
 
 # ===================== 5. 完整训练循环 =====================
-def train_two_models(kg_graph):
-    # 划分训练/测试集
+def train_two_models(kg_graph, hold_out_n=5):
+    """联合训练 R-GCN + TGN 双模型。
+
+    参数:
+        kg_graph: 异构图数据
+        hold_out_n: 从数据集尾部预留 N 个切片，既不参与训练也不参与测试，
+                    作为"未知样本"（用于验证模型在完全未见数据上的表现）。
+
+    返回:
+        diag_model, tgn_model, test_idx, hold_out_idx
+    """
     total_num = kg_graph["time_slice"].x.shape[0]
-    train_idx, test_idx = train_test_split(np.arange(total_num), test_size=0.2, random_state=42)
+    # 将最后 hold_out_n 个切片作为"未知样本"，从 train/test 切分中剔除
+    available = np.arange(total_num - hold_out_n)
+    hold_out_idx = np.arange(total_num - hold_out_n, total_num)
+    train_idx, test_idx = train_test_split(available, test_size=0.2, random_state=42)
     train_idx = torch.tensor(train_idx, dtype=torch.long).to(DEVICE)
     test_idx = torch.tensor(test_idx, dtype=torch.long).to(DEVICE)
+    hold_out_idx = torch.tensor(hold_out_idx, dtype=torch.long).to(DEVICE)
 
     # 初始化双模型
     num_time_slices = kg_graph["time_slice"].x.shape[0]
@@ -381,7 +409,8 @@ def train_two_models(kg_graph):
     diag_model.load_state_dict(best_diag_state)
     tgn_model.load_state_dict(best_tgn_state)
     print(f"\n训练完成！最优故障诊断准确率: {best_diag_acc:.4f}，最优油温预测MAE: {best_ot_mae:.4f}")
-    return diag_model, tgn_model, test_idx
+    print(f"预留未知样本数: {hold_out_idx.shape[0]}（既不参与训练也不参与测试）")
+    return diag_model, tgn_model, test_idx, hold_out_idx
 
 
 # ===================== 6. 推理打印函数（完整输出推理链路） =====================
@@ -391,8 +420,8 @@ def full_inference_print(kg_data, diag_model, tgn_model, slice_idx):
     print(f"【变压器时序推理】切片ID：{slice_idx} | 时间：{kg_data['time_slice'].date_str[slice_idx]}")
     print("=" * 100)
 
-    # 1. 提取切片基础信息
-    slice_feat = kg_data["time_slice"].x[slice_idx].cpu().numpy()
+    # 1. 提取切片基础信息（使用 x_raw 即原始未标准化值，与数据集保持一致）
+    slice_feat = kg_data["time_slice"].x_raw[slice_idx].cpu().numpy()
     true_health = kg_data["time_slice"].y_health[slice_idx].item()
     true_future_ot = kg_data["time_slice"].y_future_ot[slice_idx].item()
     print(f"\n[1] 切片基础运行信息：")
@@ -461,34 +490,50 @@ def full_inference_print(kg_data, diag_model, tgn_model, slice_idx):
 if __name__ == "__main__":
     # 1. 加载ETTh1小时级变压器数据集
     print("加载ETTh1电力变压器时序数据集...")
-    df = load_and_preprocess_dataset("/home/binchen/Workspaces/PIE-Knowledge/故障诊断+故障预测/电力变压器数据集-ETDataset/ETDataset/ETT-small/ETTh2 (副本).csv")
+    csv_path = "/home/binchen/Workspaces/PIE-Knowledge/故障诊断+故障预测/电力变压器数据集-ETDataset/ETDataset/ETT-small/ETTh2.csv"
+    df_train, df_raw, feat_mean, feat_std = load_and_preprocess_dataset(csv_path)
     # 2. 构建变压器时序异构图知识图谱
     print("构建电力变压器时序运行知识图谱...")
-    kg_graph = build_transformer_kg(df, transformer_id=0)
+    kg_graph = build_transformer_kg(df_train, df_raw, feat_mean, feat_std, transformer_id=0)
 
-    # 3. 从训练好的模型目录 ./trained_models/ 加载权重，直接执行推理
+    # 3. 模型加载或训练：若 ./trained_models 下的权重文件不存在，先训练并保存
     MODEL_DIR = "../trained_models"
     diag_path = f"{MODEL_DIR}/transformer_fault_diag_rgcn.pth"
     tgn_path = f"{MODEL_DIR}/transformer_trend_tgn.pth"
+    HOLD_OUT_N = 5   # 预留作为"未知样本"的切片数（既不参与训练也不参与测试）
 
-    num_time_slices = kg_graph["time_slice"].x.shape[0]
-    diag_model = RGCNFaultDiagnosis(HIDDEN_DIM, HEALTH_NUM).to(DEVICE)
-    tgn_model = TGNOilTemperaturePredict(HIDDEN_DIM, num_time_slices).to(DEVICE)
+    if not (os.path.exists(diag_path) and os.path.exists(tgn_path)):
+        print(f"\n{diag_path} 或 {tgn_path} 不存在，开始联合训练 R-GCN + TGN ...")
+        diag_model, tgn_model, test_idx, hold_out_idx = train_two_models(kg_graph, hold_out_n=HOLD_OUT_N)
+    else:
+        total_num = kg_graph["time_slice"].x.shape[0]
+        diag_model = RGCNFaultDiagnosis(HIDDEN_DIM, HEALTH_NUM).to(DEVICE)
+        tgn_model = TGNOilTemperaturePredict(HIDDEN_DIM, total_num).to(DEVICE)
+        print(f"加载故障诊断模型：{diag_path}")
+        diag_model.load_state_dict(torch.load(diag_path, map_location=DEVICE, weights_only=True))
+        diag_model.eval()
+        print(f"加载时序趋势预测模型：{tgn_path}")
+        tgn_model.load_state_dict(torch.load(tgn_path, map_location=DEVICE, weights_only=True))
+        tgn_model.eval()
+        # 与训练时的切分逻辑保持一致：尾部最后 HOLD_OUT_N 个切片是"未知样本"
+        available = np.arange(total_num - HOLD_OUT_N)
+        _, test_idx = train_test_split(available, test_size=0.2, random_state=42)
+        test_idx = torch.tensor(test_idx, dtype=torch.long).to(DEVICE)
+        hold_out_idx = torch.tensor(np.arange(total_num - HOLD_OUT_N, total_num), dtype=torch.long).to(DEVICE)
 
-    print(f"加载故障诊断模型：{diag_path}")
-    diag_model.load_state_dict(torch.load(diag_path, map_location=DEVICE, weights_only=True))
-    diag_model.eval()
-    print(f"加载时序趋势预测模型：{tgn_path}")
-    tgn_model.load_state_dict(torch.load(tgn_path, map_location=DEVICE, weights_only=True))
-    tgn_model.eval()
-
-    # 保持与训练时一致的 train/test 划分，用于选取测试集样本
-    total_num = kg_graph["time_slice"].x.shape[0]
-    _, test_idx = train_test_split(np.arange(total_num), test_size=0.2, random_state=42)
-    test_idx = torch.tensor(test_idx, dtype=torch.long).to(DEVICE)
-
-    # 对测试集前3个样本执行完整推理，打印全部结果
-    print("\n===== 开始批量推理测试集样本 =====")
-    for i in range(3):
+    # 4. 推理展示：分两批输出
+    #    (a) 测试集样本：训练期间见过、但未用于梯度更新的样本
+    #    (b) 未知样本：训练和测试都未使用的样本，模拟部署时的全新数据
+    print("\n" + "=" * 100)
+    print("【模式 A】推理测试集样本（训练时可见、未参与权重更新）")
+    print("=" * 100)
+    for i in range(min(3, test_idx.shape[0])):
         slice_id = test_idx[i].item()
+        full_inference_print(kg_graph, diag_model, tgn_model, slice_id)
+
+    print("=" * 100)
+    print(f"【模式 B】推理未知样本（{hold_out_idx.shape[0]} 个，既不在训练集也不在测试集）")
+    print("=" * 100)
+    for i in range(min(3, hold_out_idx.shape[0])):
+        slice_id = hold_out_idx[i].item()
         full_inference_print(kg_graph, diag_model, tgn_model, slice_id)
