@@ -71,6 +71,9 @@ class DiagnosisResult:
     system: str = ""
     category: str = ""
 
+    # 当图谱关系名与默认语义角色不匹配时，按真实关系名分组的关系数据
+    relations: Dict[str, List[str]] = field(default_factory=dict)
+
     # 备选故障的诊断信息
     alternative_faults: List[Dict] = field(default_factory=list)
 
@@ -84,13 +87,14 @@ def match_symptoms(
         model,
         dataset,
         query_text: str,
+        symptom_relation: str,
         top_k: int = 5,
         similarity_threshold: float = 0.0,
 ) -> List[Tuple[str, float]]:
-    """计算输入文本与图中所有症状节点的语义相似度。
+    """计算输入文本与图中节点的语义相似度。
 
-    使用 R-GCN 的 node_emb 层（未经图卷积的嵌入）作为文本表示，
-    通过简单的子串匹配 + 嵌入相似度进行语义检索。
+    优先匹配症状节点（symptom_relation 的 tail）。当图谱不存在该关系时，
+    退化为全图节点匹配，实现 type-agnostic 推理。
 
     Parameters
     ----------
@@ -101,35 +105,44 @@ def match_symptoms(
     query_text : str
         用户输入的自然语言症状描述。
     top_k : int
-        返回的最相似症状数量。
+        返回的最相似节点数量。
     similarity_threshold : float
         最低相似度阈值（0-1），低于此值的匹配将被过滤。
+    symptom_relation : str
+        用于识别症状节点的关系名称（默认: "表现为"）。
 
     Returns
     -------
     List[Tuple[str, float]]
-        [(symptom_text, similarity_score), ...] 按相似度降序排列。
+        [(node_text, similarity_score), ...] 按相似度降序排列。
     """
-    symptom_nodes = dataset.get_symptom_nodes()
-    if not symptom_nodes:
-        logger.warning("图中没有症状节点，无法进行语义匹配")
+    # type-agnostic fallback：没有指定关系时匹配所有节点
+    if dataset.has_relation(symptom_relation):
+        candidate_nodes = dataset.get_symptom_nodes(symptom_relation)
+    else:
+        candidate_nodes = [
+            dataset.idx_to_node[i] for i in range(dataset.num_nodes)
+        ]
+
+    if not candidate_nodes:
+        logger.warning("图中没有候选节点，无法进行语义匹配")
         return []
 
     model.eval()
     device = next(model.parameters()).device
 
     with torch.no_grad():
-        # 获取所有症状节点的嵌入
-        symptom_indices = [
-            dataset.node_to_idx[s] for s in symptom_nodes
+        # 获取所有候选节点的嵌入
+        candidate_indices = [
+            dataset.node_to_idx[s] for s in candidate_nodes
             if s in dataset.node_to_idx
         ]
-        if not symptom_indices:
+        if not candidate_indices:
             return []
 
-        symptom_embs = model.node_emb(
-            torch.tensor(symptom_indices, device=device)
-        )  # [num_symptoms, hidden_dim]
+        candidate_embs = model.node_emb(
+            torch.tensor(candidate_indices, device=device)
+        )  # [num_candidates, hidden_dim]
 
         # 查询文本编码：用文本中的字符在节点嵌入中的平均表示
         # 策略：对包含查询文本字符的所有节点的嵌入求均值作为查询向量
@@ -137,7 +150,7 @@ def match_symptoms(
         matched_indices = []
         matched_weights = []
 
-        for s, node_name in enumerate(symptom_nodes):
+        for s, node_name in enumerate(candidate_nodes):
             if node_name not in dataset.node_to_idx:
                 continue
             # 计算 Jaccard 字符重叠度作为初始权重
@@ -151,34 +164,34 @@ def match_symptoms(
 
         if not matched_indices:
             # 没有任何字符重叠，返回 top-k 作为降级方案
-            logger.debug("无字符级匹配，返回前 %d 个症状", top_k)
-            matched_indices = list(range(min(top_k, len(symptom_nodes))))
+            logger.debug("无字符级匹配，返回前 %d 个候选节点", top_k)
+            matched_indices = list(range(min(top_k, len(candidate_nodes))))
             matched_weights = [0.0] * len(matched_indices)
 
         # 加权均值构成 query embedding
         weights_tensor = torch.tensor(
             matched_weights, device=device, dtype=torch.float
         )
-        matched_embs = symptom_embs[matched_indices]  # [M, hidden_dim]
+        matched_embs = candidate_embs[matched_indices]  # [M, hidden_dim]
         query_emb = (
-            matched_embs * weights_tensor.unsqueeze(-1)
+                matched_embs * weights_tensor.unsqueeze(-1)
         ).sum(dim=0, keepdim=True)
         query_emb = F.normalize(query_emb / (weights_tensor.sum() + 1e-8), p=2)
 
-        # 计算所有症状节点的余弦相似度
-        symptom_embs_norm = F.normalize(symptom_embs, p=2)
-        scores = (symptom_embs_norm * query_emb).sum(dim=-1)  # [num_symptoms]
+        # 计算所有候选节点的余弦相似度
+        candidate_embs_norm = F.normalize(candidate_embs, p=2)
+        scores = (candidate_embs_norm * query_emb).sum(dim=-1)  # [num_candidates]
 
         # 排序取 top-k
         top_scores, top_indices = torch.topk(
             scores, min(top_k, len(scores))
         )
         results = [
-            (symptom_nodes[idx.item()], score.item())
+            (candidate_nodes[idx.item()], score.item())
             for idx, score in zip(top_indices, top_scores)
         ]
         logger.info(
-            "语义匹配: '%s' → %d 个症状 (%s → %.3f)",
+            "语义匹配: '%s' → %d 个候选节点 (%s → %.3f)",
             query_text,
             len(results),
             results[0][0] if results else "none",
@@ -205,14 +218,16 @@ def locate_fault(
         model,
         dataset,
         matched_symptoms: List[Tuple[str, float]],
+        symptom_relation: str,
         top_k: int = 3,
 ) -> List[Tuple[str, float]]:
-    """根据匹配到的症状节点，定位最可能的故障类别。
+    """根据匹配到的节点，定位最可能的中心节点。
 
     工作流程：
-    1. 沿"表现为"边反向遍历，找到与症状相连的故障类别节点
-    2. 用 R-GCN 编码的节点嵌入计算症状聚合向量与故障节点的余弦相似度
-    3. 按相似度降序排列返回 Top-K 候选故障
+    1. 若存在 symptom_relation 关系，沿其反向遍历找到相连的故障类别节点；
+       否则退化为 type-agnostic：收集所有邻居节点作为候选。
+    2. 用 R-GCN 编码的节点嵌入计算余弦相似度排序。
+    3. 按综合得分降序返回 Top-K 候选。
 
     Parameters
     ----------
@@ -221,14 +236,16 @@ def locate_fault(
     dataset : KGFaultDataset
         知识图谱数据集。
     matched_symptoms : List[Tuple[str, float]]
-        match_symptoms 的输出，[(symptom, score), ...]。
+        match_symptoms 的输出，[(node, score), ...]。
     top_k : int
-        返回的候选故障数量。
+        返回的候选节点数量。
+    symptom_relation : str
+        用于识别症状节点与故障节点之间关系的名称（默认: "表现为"）。
 
     Returns
     -------
     List[Tuple[str, float]]
-        [(fault_name, confidence_score), ...] 按置信度降序。
+        [(node_name, confidence_score), ...] 按置信度降序。
     """
     if not matched_symptoms:
         return []
@@ -237,33 +254,36 @@ def locate_fault(
     device = next(model.parameters()).device
 
     with torch.no_grad():
-        # Step 1: 通过图拓扑找到候选故障节点
-        candidate_faults: Dict[str, float] = {}  # fault_name → topology_score
+        # Step 1: 通过图拓扑找到候选中心节点
+        candidate_faults: Dict[str, float] = {}  # node_name → topology_score
 
         for symptom, sim_score in matched_symptoms:
-            # 沿"表现为"反向查找：谁"表现为"这个症状？
-            fault_heads = dataset.get_backward(symptom, "表现为")
+            if dataset.has_relation(symptom_relation):
+                # 沿 symptom_relation 反向查找
+                fault_heads = dataset.get_backward(symptom, symptom_relation)
+            else:
+                # type-agnostic：收集该节点的所有邻居
+                fault_heads = dataset.get_all_neighbors(symptom)
+
             for fault_name in fault_heads:
                 if fault_name not in dataset.node_to_idx:
                     continue
-                # 累积拓扑权重（症状相似度越高则故障可能性越大）
+                # 累积拓扑权重（匹配得分越高则候选可能性越大）
                 candidate_faults[fault_name] = max(
                     candidate_faults.get(fault_name, 0.0),
                     sim_score,
                 )
 
         if not candidate_faults:
-            logger.warning("未找到与症状相连的故障节点，尝试全局搜索...")
-            # 降级：使用所有故障类别节点
+            logger.warning("未找到与候选节点相连的中心节点，尝试全局搜索...")
+            # 降级：使用所有故障类别节点；若仍为空则使用全图节点
             all_faults = dataset.get_fault_category_nodes()
             if not all_faults:
-                all_faults = [
-                    f for f in dataset.fault_nodes
-                ]
+                all_faults = list(dataset.fault_nodes)
             candidate_faults = {f: 0.0 for f in all_faults}
 
         # Step 2: 用 R-GCN 嵌入计算语义相似度
-        # 对匹配的症状节点嵌入求加权平均作为 query
+        # 对匹配的节点嵌入求加权平均作为 query
         symptom_indices = [
             dataset.node_to_idx[s]
             for s, _ in matched_symptoms
@@ -281,11 +301,11 @@ def locate_fault(
             if len(weights) < len(symptom_indices):
                 weights = torch.ones(len(symptom_indices), device=device)
             query_emb = (
-                symptom_embs * weights.unsqueeze(-1)
+                    symptom_embs * weights.unsqueeze(-1)
             ).sum(dim=0, keepdim=True)
             query_emb = F.normalize(query_emb / (weights.sum() + 1e-8), p=2)
 
-            # 计算每个候选故障与 query 的余弦相似度
+            # 计算每个候选节点与 query 的余弦相似度
             scored: List[Tuple[str, float]] = []
             for fault_name, topo_score in candidate_faults.items():
                 if fault_name not in dataset.node_to_idx:
@@ -304,7 +324,7 @@ def locate_fault(
         result = scored[:top_k]
 
         logger.info(
-            "故障定位: %d 个候选 → Top-%d: %s (%.3f)",
+            "中心定位: %d 个候选 → Top-%d: %s (%.3f)",
             len(scored),
             min(top_k, len(result)),
             result[0][0] if result else "none",
@@ -321,23 +341,26 @@ def locate_fault(
 def generate_answer(
         dataset,
         fault_name: str,
+        relation_mapping: Optional[Dict[str, str]] = None,
 ) -> Dict[str, List[str]]:
-    """以故障节点为中心，沿知识图谱提取诊断结构。
+    """以中心节点为中心，沿知识图谱提取诊断结构。
 
     Parameters
     ----------
     dataset : KGFaultDataset
         知识图谱数据集。
     fault_name : str
-        故障类别节点名称。
+        中心节点名称。
+    relation_mapping : Optional[Dict[str, str]]
+        语义角色 → 实际关系名的映射，用于 type-agnostic 输出。
 
     Returns
     -------
     Dict[str, List[str]]
         {"causes": [...], "actions": [...], "tools": [...],
-         "system": [...], "symptoms": [...]}
+         "system": [...], "symptoms": [...]} 或按真实关系名分组。
     """
-    return dataset.get_fault_info(fault_name)
+    return dataset.get_fault_info(fault_name, relation_mapping=relation_mapping)
 
 
 # ================================================================
@@ -406,6 +429,11 @@ def format_result(result: DiagnosisResult) -> str:
             for tool in result.tools:
                 lines.append(f"    • {tool}")
 
+        if result.relations:
+            lines.append(f"\n  📎 关系详情 (Type-agnostic):")
+            for relation, nodes in result.relations.items():
+                lines.append(f"    • {relation}: {', '.join(nodes[:5])}")
+
     # 备选故障
     if result.alternative_faults:
         lines.append(f"\n📝 备选故障诊断:")
@@ -465,10 +493,12 @@ def infer_from_text(
         model,
         dataset,
         query_text: str,
+        symptom_relation: str,
         top_k_symptoms: int = 5,
         top_k_faults: int = 3,
         similarity_threshold: float = 0.0,
         device: Optional[str] = None,
+        relation_mapping: Optional[Dict[str, str]] = None,
 ) -> DiagnosisResult:
     """完整的四阶段故障诊断推理管线。
 
@@ -491,6 +521,11 @@ def infer_from_text(
         症状匹配的最低相似度阈值。
     device : Optional[str]
         推理设备，None 则跟随模型当前设备。
+    relation_mapping : Optional[Dict[str, str]]
+        语义角色 → 实际关系名的映射。用于 type-agnostic 输出。
+        例如 {"causes": "原因", "actions": "处理措施"}。
+    symptom_relation : str
+        用于识别症状节点与故障节点之间关系的名称（默认: "表现为"）。
 
     Returns
     -------
@@ -509,6 +544,7 @@ def infer_from_text(
         model, dataset, query_text,
         top_k=top_k_symptoms,
         similarity_threshold=similarity_threshold,
+        symptom_relation=symptom_relation,
     )
     result.matched_symptoms = matched_symptoms
 
@@ -518,7 +554,9 @@ def infer_from_text(
 
     # ---- Phase 2: 故障定位 ----
     fault_candidates = locate_fault(
-        model, dataset, matched_symptoms,
+        model, dataset,
+        matched_symptoms=matched_symptoms,
+        symptom_relation=symptom_relation,
         top_k=top_k_faults,
     )
     result.fault_candidates = fault_candidates
@@ -530,27 +568,50 @@ def infer_from_text(
     best_fault, best_score = fault_candidates[0]
     result.best_fault = best_fault
 
-    info = generate_answer(dataset, best_fault)
-    result.causes = info.get("causes", [])
-    result.actions = info.get("actions", [])
-    result.tools = info.get("tools", [])
-    result.system = (
-        info.get("system", [""])[0] if info.get("system") else ""
-    )
-    result.category = (
-        info.get("category", [""])[0] if info.get("category") else ""
-    )
+    info = generate_answer(dataset, best_fault, relation_mapping=relation_mapping)
+    standard_keys = {"causes", "actions", "tools", "system", "category", "symptoms"}
+    if set(info.keys()).issubset(standard_keys):
+        result.causes = info.get("causes", [])
+        result.actions = info.get("actions", [])
+        result.tools = info.get("tools", [])
+        result.system = (
+            info.get("system", [""])[0] if info.get("system") else ""
+        )
+        result.category = (
+            info.get("category", [""])[0] if info.get("category") else ""
+        )
+    else:
+        # type-agnostic：保留原始关系分组，并尝试将常见同义词回填到标准字段
+        result.relations = info
+        result.causes = info.get("causes", info.get("原因", []))
+        result.actions = info.get("actions", info.get("维修措施", info.get("处理措施", [])))
+        result.tools = info.get("tools", info.get("需要工具", info.get("工具", [])))
+        result.system = (
+            info.get("system", info.get("系统", [""]))[0]
+            if info.get("system") or info.get("系统")
+            else ""
+        )
+        result.category = (
+            info.get("category", info.get("类别", [""]))[0]
+            if info.get("category") or info.get("类别")
+            else ""
+        )
 
     # ---- Phase 4: 备选故障详情 ----
     for fault_name, score in fault_candidates[1:]:
-        alt_info = generate_answer(dataset, fault_name)
-        result.alternative_faults.append({
+        alt_info = generate_answer(dataset, fault_name, relation_mapping=relation_mapping)
+        alt_result = {
             "fault": fault_name,
             "confidence": score,
             "causes": alt_info.get("causes", []),
             "actions": alt_info.get("actions", []),
             "tools": alt_info.get("tools", []),
-        })
+        }
+        if not (alt_result["causes"]
+                or alt_result["actions"]
+                or alt_result["tools"]):
+            alt_result["relations"] = alt_info
+        result.alternative_faults.append(alt_result)
 
     logger.info(
         "推理管线完成: '%s' → %s (%.3f), %d causes, %d actions, %d tools",

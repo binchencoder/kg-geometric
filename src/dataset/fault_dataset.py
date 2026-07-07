@@ -24,8 +24,6 @@ class KGFaultDataset:
 
     Parameters
     ----------
-    use_es : bool
-        是否从 Elasticsearch 加载三元组（默认 True）。失败时自动回退到内置数据。
     es_entity_index : str
         ES 实体索引名称。
     es_relation_index : str
@@ -34,8 +32,6 @@ class KGFaultDataset:
         ES 关系类型索引名称。
     es_batch_size : int
         ES scan 批次大小。
-    es_query : Optional[dict]
-        额外的 ES 查询过滤条件（如按 graphId 过滤）。
     es_head_field : str
         关系文档中头实体 ID 字段名。
     es_tail_field : str
@@ -50,6 +46,8 @@ class KGFaultDataset:
         关系类型文档中 ID 字段名。
     es_relation_type_name_field : str
         关系类型文档中名称字段名。
+    use_builtin_example : bool
+        是否使用内置 CVFFAD 示例数据（默认 False）。
 
     图遍历 API:
     - get_forward(head, relation) → List[tail]
@@ -60,9 +58,9 @@ class KGFaultDataset:
 
     def __init__(
             self,
+            es_config: ESConfig,
             graph_id: str = "992504969637961728",
             ontology_id: str = "992355151124930560",
-            use_es: bool = True,
             es_entity_index: str = "knowledge_entity_index",
             es_relation_index: str = "knowledge_entity_relation_index",
             es_relation_type_index: str = "knowledge_entity_type_relation_index",
@@ -74,8 +72,9 @@ class KGFaultDataset:
             es_entity_name_field: str = "name",
             es_relation_type_id_field: str = "relationTypeId",
             es_relation_type_name_field: str = "name",
+            use_builtin_example: bool = False,
     ) -> None:
-        if use_es:
+        if not use_builtin_example:
             try:
                 self.triples = self._load_from_es(
                     graph_id=graph_id,
@@ -143,7 +142,6 @@ class KGFaultDataset:
             entity_index: str = "knowledge_entity_index",
             relation_index: str = "knowledge_entity_relation_index",
             relation_type_index: str = "knowledge_entity_type_relation_index",
-            query: Optional[dict] = None,
             head_field: str = "srcEntityId",
             relation_field: str = "relationTypeId",
             tail_field: str = "dstEntityId",
@@ -414,11 +412,17 @@ class KGFaultDataset:
         """
         return list(self._backward.get(relation, {}).get(tail, []))
 
-    def get_symptom_nodes(self) -> List[str]:
-        """获取所有症状描述节点（"表现为"关系的 tail）。"""
+    def get_symptom_nodes(self, relation: str) -> List[str]:
+        """获取所有症状描述节点（指定关系的 tail）。
+
+        Parameters
+        ----------
+        relation : str
+            用于识别症状节点的关系名称（默认: "表现为"）。
+        """
         symptoms = set()
         for triple in self.triples:
-            if triple.relation == "表现为":
+            if triple.relation == relation:
                 symptoms.add(triple.tail)
         return sorted(symptoms)
 
@@ -434,34 +438,78 @@ class KGFaultDataset:
                 fault_categories.add(triple.head)
         return sorted(fault_categories)
 
-    def get_fault_info(self, fault_node: str) -> Dict[str, List[str]]:
+    def get_fault_info(
+            self,
+            fault_node: str,
+            relation_mapping: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, List[str]]:
         """获取指定故障节点的完整诊断信息。
 
         Parameters
         ----------
         fault_node : str
             故障类别节点名称，如 "发动机动力不足"。
+        relation_mapping : Optional[Dict[str, str]]
+            语义角色 → 实际关系名的映射。例如
+            {"causes": "由...引起", "actions": "维修措施"}。
+            不传则使用默认映射；若默认映射在当前图谱中不存在，
+            则按真实关系名分组返回。
 
         Returns
         -------
         Dict[str, List[str]]
-            {
-                "symptoms": ["表现为"的 tail],
-                "causes": ["由...引起"的 tail],
-                "actions": ["维修措施"的 tail],
-                "tools": ["需要工具"的 tail],
-                "system": ["属于系统"的 tail],
-                "category": ["属于类别"的 tail],
-            }
+            若使用默认/指定映射：
+                {"symptoms": [...], "causes": [...], "actions": [...],
+                 "tools": [...], "system": [...], "category": [...]}
+            若映射全部失效（ type-agnostic 模式）：
+                {relation_name: [tails], ...}
         """
-        return {
-            "symptoms": self.get_forward(fault_node, "表现为"),
-            "causes": self.get_forward(fault_node, "由...引起"),
-            "actions": self.get_forward(fault_node, "维修措施"),
-            "tools": self.get_forward(fault_node, "需要工具"),
-            "system": self.get_forward(fault_node, "属于系统"),
-            "category": self.get_forward(fault_node, "属于类别"),
+        default_mapping = {
+            "symptoms": "表现为",
+            "causes": "由...引起",
+            "actions": "维修措施",
+            "tools": "需要工具",
+            "system": "属于系统",
+            "category": "属于类别",
         }
+        mapping = relation_mapping if relation_mapping is not None else default_mapping
+
+        result: Dict[str, List[str]] = {}
+        for key, relation in mapping.items():
+            if self.has_relation(relation):
+                result[key] = self.get_forward(fault_node, relation)
+
+        # 若映射中没有任何关系命中，退化为 type-agnostic：按真实关系名分组
+        if not result:
+            result = {
+                relation: self.get_forward(fault_node, relation)
+                for relation in self.relation_list
+                if self.get_forward(fault_node, relation)
+            }
+
+        return result
+
+    def has_relation(self, relation: str) -> bool:
+        """判断图谱中是否存在指定关系类型。"""
+        return relation in self._forward
+
+    def get_out_neighbors(self, node: str) -> List[str]:
+        """获取节点的所有正向邻居（不区分关系类型）。"""
+        neighbors: set = set()
+        for relation in self._forward.values():
+            neighbors.update(relation.get(node, []))
+        return sorted(neighbors)
+
+    def get_in_neighbors(self, node: str) -> List[str]:
+        """获取节点的所有反向邻居（不区分关系类型）。"""
+        neighbors: set = set()
+        for relation in self._backward.values():
+            neighbors.update(relation.get(node, []))
+        return sorted(neighbors)
+
+    def get_all_neighbors(self, node: str) -> List[str]:
+        """获取节点的所有邻居（双向、不区分关系类型）。"""
+        return sorted(set(self.get_out_neighbors(node)) | set(self.get_in_neighbors(node)))
 
     # ================================================================
     # PyG Data 导出
