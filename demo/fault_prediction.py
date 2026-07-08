@@ -91,7 +91,17 @@ def build_transformer_kg(df_train, df_raw, feat_mean, feat_std, transformer_id=0
     data["time_slice"].x = torch.tensor(df_train[FEATURE_LIST].values, dtype=torch.float32)
     data["time_slice"].x_raw = torch.tensor(df_raw[FEATURE_LIST].values, dtype=torch.float32)
     data["time_slice"].y_health = torch.tensor(df_raw["health_label"].values, dtype=torch.long)
+    # y_future_ot：原始摄氏度（展示用）；y_future_ot_norm：z-score 化的训练目标（让 loss 量级与其他任务可比）
     data["time_slice"].y_future_ot = torch.tensor(df_raw["future_OT"].values, dtype=torch.float32)
+    ot_raw = df_raw["OT"].values.astype(np.float32)
+    ot_mean = np.float32(ot_raw.mean())
+    ot_std = np.float32(max(ot_raw.std(), 1e-6))
+    data["time_slice"].y_future_ot_norm = torch.tensor(
+        (df_raw["future_OT"].values.astype(np.float32) - ot_mean) / ot_std,
+        dtype=torch.float32,
+    )
+    data["time_slice"].ot_mean = torch.tensor(ot_mean, dtype=torch.float32)
+    data["time_slice"].ot_std = torch.tensor(ot_std, dtype=torch.float32)
     # 顺序序号用于 TGN 时序编码，同时保存真实日期时间字符串与反归一化统计量
     data["time_slice"].time = torch.tensor(np.arange(slice_num), dtype=torch.float32).unsqueeze(1)
     data["time_slice"].date_str = df_raw["date"].dt.strftime("%Y-%m-%d %H:%M:%S").tolist()
@@ -110,6 +120,18 @@ def build_transformer_kg(df_train, df_raw, feat_mean, feat_std, transformer_id=0
     data["transformer", "has_time_slice", "time_slice"].edge_index = torch.tensor(trans2slice).T
     # 时序边时间戳（TGN需要）
     data["transformer", "has_time_slice", "time_slice"].edge_time = data["time_slice"].time.squeeze()
+
+    # === 新增：time_slice 相邻时序边 ===
+    # 构建边：time_slice_i -> next -> time_slice_{i+1}
+    # 让 TGN 能在相邻时间切片之间传递状态，学习真实的油温变化趋势
+    if slice_num > 1:
+        next_src = list(range(slice_num - 1))  # 0, 1, ..., N-2
+        next_dst = list(range(1, slice_num))    # 1, 2, ..., N-1
+        data["time_slice", "next", "time_slice"].edge_index = torch.tensor(
+            [next_src, next_dst], dtype=torch.long
+        )
+        # 边的时间戳 = dst 的时间（表示"在 i+1 时刻，slice i 的状态影响 slice i+1"）
+        data["time_slice", "next", "time_slice"].edge_time = data["time_slice"].time.squeeze()[1:]
 
     # 构建边：time_slice -> has_health_state -> health_state
     slice2health = []
@@ -233,9 +255,15 @@ class TGN(torch.nn.Module):
                 src_type, _, dst_type = edge_type
                 edge_index = edge_index_dict[edge_type]
                 src, dst = edge_index[0], edge_index[1]
-                # 映射索引：transformer→0, time_slice i→i+1
-                src_mapped = torch.zeros(len(src), dtype=torch.long, device=device)
-                dst_mapped = dst + 1
+                # 映射索引：transformer→0, time_slice i→i+1 (memory 中保留 slot 0 给 transformer)
+                if src_type == "transformer":
+                    src_mapped = torch.zeros(len(src), dtype=torch.long, device=device)
+                else:  # src_type == "time_slice"
+                    src_mapped = src + 1
+                if dst_type == "transformer":
+                    dst_mapped = torch.zeros(len(dst), dtype=torch.long, device=device)
+                else:  # dst_type == "time_slice"
+                    dst_mapped = dst + 1
                 # 按时序排序，保证时间因果性
                 time_order = edge_time.argsort()
                 src_mapped = src_mapped[time_order]
@@ -279,6 +307,7 @@ class TGNOilTemperaturePredict(torch.nn.Module):
             out_channels=hidden_dim,
             edge_types=[
                 ("transformer", "has_time_slice", "time_slice"),
+                ("time_slice", "next", "time_slice"),        # 相邻时序边
                 ("time_slice", "has_health_state", "health_state"),
                 ("time_slice", "has_feature", "feature_indicator"),
                 ("health_state", "state_has_symbol", "feature_indicator"),
@@ -286,9 +315,10 @@ class TGNOilTemperaturePredict(torch.nn.Module):
             num_layers=2,
             num_time_slices=num_time_slices,
         )
-        # 油温预测头
+        # 油温预测头：将 GNN embedding 与原始 OT 特征做 skip-connection
+        # 这样模型至少能达到 "用当前油温预测未来油温" 的基线水平
         self.ot_head = nn.Sequential(
-            Linear(hidden_dim, 16),
+            Linear(hidden_dim + 1, 16),
             nn.ReLU(),
             Linear(16, 1)
         )
@@ -301,14 +331,24 @@ class TGNOilTemperaturePredict(torch.nn.Module):
         )
 
     def forward(self, hetero_data):
+        # edge_time_dict 同时包含 transformer->slice 边与 slice->next->slice 边
+        edge_time_dict = {
+            ("transformer", "has_time_slice", "time_slice"):
+                hetero_data["transformer", "has_time_slice", "time_slice"].edge_time,
+            ("time_slice", "next", "time_slice"):
+                hetero_data["time_slice", "next", "time_slice"].edge_time,
+        }
         emb_dict = self.gnn(
             x_dict=hetero_data.x_dict,
             edge_index_dict=hetero_data.edge_index_dict,
-            edge_time_dict={("transformer", "has_time_slice", "time_slice"): hetero_data[
-                "transformer", "has_time_slice", "time_slice"].edge_time}
+            edge_time_dict=edge_time_dict,
         )
         slice_emb = emb_dict["time_slice"]
-        future_ot = self.ot_head(slice_emb)
+        # Skip-connection：将标准化后的 OT 特征直接拼接到 embedding，
+        # 保证模型至少能达到 "用当前油温预测未来油温" 的基线水平
+        ot_feature = hetero_data["time_slice"].x[:, -1].unsqueeze(-1)  # 最后一列是 OT (z-score)
+        ot_input = torch.cat([slice_emb, ot_feature], dim=-1)
+        future_ot = self.ot_head(ot_input)
         fault_risk = self.risk_head(slice_emb)
         return future_ot, fault_risk, slice_emb
 
@@ -361,7 +401,11 @@ def train_two_models(kg_graph, hold_out_n=5):
 
         # 计算多任务损失
         loss1 = loss_cls(health_logits[train_idx], kg_graph["time_slice"].y_health[train_idx])
-        loss2 = loss_ot(future_ot_pred.squeeze()[train_idx], kg_graph["time_slice"].y_future_ot[train_idx])
+        # loss2 使用 z-score 化的目标：让油温回归任务的 loss 量级与分类任务可比 (~1.0 vs ~0.1)
+        # 否则 MSE 在摄氏度尺度上约 100，而 CrossEntropy 约 0.001，完全淹没分类信号
+        ot_mean = kg_graph["time_slice"].ot_mean
+        ot_std = kg_graph["time_slice"].ot_std
+        loss2 = loss_ot(future_ot_pred.squeeze()[train_idx], kg_graph["time_slice"].y_future_ot_norm[train_idx])
         # 风险标签：严重过热/过载故障为高风险1，其他为0
         risk_label = (kg_graph["time_slice"].y_health >= 2).float()
         loss3 = loss_risk(fault_risk_pred.squeeze()[train_idx], risk_label[train_idx])
@@ -378,10 +422,11 @@ def train_two_models(kg_graph, hold_out_n=5):
                 kg_graph["time_slice"].y_health[test_idx].cpu().numpy(),
                 pred_health[test_idx].cpu().numpy()
             )
-            # 油温预测MAE
+            # 油温预测MAE：反标准化回摄氏度再评估
+            future_ot_celsius = future_ot_pred.squeeze().detach() * ot_std + ot_mean
             ot_mae = mean_absolute_error(
                 kg_graph["time_slice"].y_future_ot[test_idx].cpu().numpy(),
-                future_ot_pred.squeeze()[test_idx].cpu().numpy()
+                future_ot_celsius[test_idx].cpu().numpy()
             )
             # 风险预测精度
             risk_pred = (fault_risk_pred.squeeze() >= 0.5).float()
@@ -460,10 +505,13 @@ def full_inference_print(kg_data, diag_model, tgn_model, slice_idx):
     for rule in rules:
         print(f"  {rule}")
 
-    # 4. TGN时序趋势预测
+    # 4. TGN时序趋势预测（模型输出是 z-score，需反标准化成摄氏度）
     with torch.no_grad():
         future_ot_pred, fault_risk_pred, _ = tgn_model(kg_data)
-        pred_future_ot = future_ot_pred[slice_idx].item()
+        ot_mean_val = kg_data["time_slice"].ot_mean.item()
+        ot_std_val = kg_data["time_slice"].ot_std.item()
+        # 反标准化：z-score → 摄氏度
+        pred_future_ot = future_ot_pred[slice_idx].item() * ot_std_val + ot_mean_val
         pred_fault_risk = fault_risk_pred[slice_idx].item()
 
     risk_level = "低风险" if pred_fault_risk < 0.3 else ("中风险" if pred_fault_risk < 0.7 else "高风险")
@@ -497,10 +545,10 @@ if __name__ == "__main__":
     kg_graph = build_transformer_kg(df_train, df_raw, feat_mean, feat_std, transformer_id=0)
 
     # 3. 模型加载或训练：若 ./trained_models 下的权重文件不存在，先训练并保存
-    MODEL_DIR = "../trained_models"
+    MODEL_DIR = "./trained_models"
     diag_path = f"{MODEL_DIR}/transformer_fault_diag_rgcn.pth"
     tgn_path = f"{MODEL_DIR}/transformer_trend_tgn.pth"
-    HOLD_OUT_N = 5   # 预留作为"未知样本"的切片数（既不参与训练也不参与测试）
+    HOLD_OUT_N = 10   # 预留作为"未知样本"的切片数（既不参与训练也不参与测试）
 
     if not (os.path.exists(diag_path) and os.path.exists(tgn_path)):
         print(f"\n{diag_path} 或 {tgn_path} 不存在，开始联合训练 R-GCN + TGN ...")
