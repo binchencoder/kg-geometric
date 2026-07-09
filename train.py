@@ -20,7 +20,7 @@ import torch
 
 from src.model.rgcn import FaultRGCN
 from src.model.training import split_masks, train_rgcn, evaluate
-from src.dataset.fault_dataset import KGFaultDataset
+from src.dataset.triple_dataset import KGTripleDataset
 from src.pipeline.inference import (
     infer_from_text,
     format_result,
@@ -38,7 +38,7 @@ def set_seed(seed: int) -> None:
 
 
 def run_training(
-        dataset: KGFaultDataset,
+        dataset: KGTripleDataset,
         hidden_dim: int = 64,
         num_layers: int = 2,
         dropout: float = 0.3,
@@ -52,7 +52,7 @@ def run_training(
 
     Parameters
     ----------
-    dataset : KGFaultDataset
+    dataset : KGTripleDataset
         知识图谱数据集（含 edge_index, edge_type, y）。
     hidden_dim : int
         隐藏层/嵌入维度。
@@ -166,7 +166,7 @@ def run_training(
 
 def run_inference(
         model: FaultRGCN,
-        dataset: KGFaultDataset,
+        dataset: KGTripleDataset,
         query: str,
         top_k_symptoms: int = 5,
         top_k_faults: int = 3,
@@ -178,7 +178,7 @@ def run_inference(
     ----------
     model : FaultRGCN
         训练好的 R-GCN 模型。
-    dataset : KGFaultDataset
+    dataset : KGTripleDataset
         知识图谱数据集。
     query : str
         用户输入的症状描述文本。
@@ -287,7 +287,7 @@ def main() -> None:
 
     # ---- 阶段 1: 加载数据集 ----
     print("\n📦 加载 “车辆故障诊断” 知识图谱...")
-    dataset = KGFaultDataset(es_config=es_config)
+    dataset = KGTripleDataset(es_config=es_config)
     print(f"  数据源: {dataset._data_source}")
     print(f"  实体: {dataset.num_nodes}")
     print(f"  关系类型: {dataset.num_original_relations}")

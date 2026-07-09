@@ -11,7 +11,7 @@ from typing import Dict, Iterator, List, Optional, Tuple
 from elasticsearch import Elasticsearch
 from elasticsearch.helpers import scan
 
-from src.core.config import ESConfig, BatchProgress, logger
+from src.core.config import ESConfig, KnowledgeGraphSchema, BatchProgress, logger
 from src.core.types import Triple
 from .client import (
     create_es_client,
@@ -41,7 +41,7 @@ class ESKnowledgeGraphReader:
     """
 
     def __init__(self, config: Optional[ESConfig] = None) -> None:
-        self.config = config or ESConfig()
+        self.config = config or ESConfig.default()
         self._client: Optional[Elasticsearch] = None
 
     # ---- 连接管理 ----
@@ -68,6 +68,14 @@ class ESKnowledgeGraphReader:
             self._client = None
             logger.info("Elasticsearch 连接已关闭")
 
+    # ---- 上下文管理器 ----
+    def __enter__(self) -> "ESKnowledgeGraphReader":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        """退出 with 块时自动关闭连接。异常会原封不动地向上抛出。"""
+        self.close()
+
     # ---- 索引发现 ----
     def list_indices(self, pattern: str = "*") -> List[str]:
         """列出匹配模式的所有索引。"""
@@ -82,19 +90,22 @@ class ESKnowledgeGraphReader:
             self,
             graph_id: str,
             ontology_id: str,
-            batch_size: int = 5000,
-            entity_index: str = "knowledge_entity_index",
-            relation_index: str = "knowledge_entity_relation_index",
-            relation_type_index: str = "knowledge_entity_type_relation_index",
-            entity_id_field: str = "entityId",
-            entity_name_field: str = "name",
-            head_id_field: str = "srcEntityId",
-            tail_id_field: str = "dstEntityId",
-            relation_field: str = "relationTypeId",
-            relation_type_id_field: str = "relationTypeId",
-            relation_type_name_field: str = "name",
+            batch_size: Optional[int] = None,
+            entity_index: Optional[str] = None,
+            relation_index: Optional[str] = None,
+            relation_type_index: Optional[str] = None,
+            entity_id_field: Optional[str] = None,
+            entity_name_field: Optional[str] = None,
+            head_id_field: Optional[str] = None,
+            tail_id_field: Optional[str] = None,
+            relation_field: Optional[str] = None,
+            relation_type_id_field: Optional[str] = None,
+            relation_type_name_field: Optional[str] = None,
     ) -> List[Triple]:
         """从 ES 实体/关系索引读取数据并构建三元组列表。
+
+        索引名与字段名的默认值从 ``config/config.yaml`` 的 ``knowledge_graph``
+        段加载；显式传入的值会覆盖 YAML 中的配置。
 
         查询流程（三步）：
         1. 从 entity_index 读取实体，构建 entityId → name 映射
@@ -135,6 +146,31 @@ class ESKnowledgeGraphReader:
         List[Triple]
             标准三元组列表。
         """
+        schema = KnowledgeGraphSchema.default().override(
+            batch_size=batch_size,
+            entity_index=entity_index,
+            relation_index=relation_index,
+            relation_type_index=relation_type_index,
+            entity_id_field=entity_id_field,
+            entity_name_field=entity_name_field,
+            head_id_field=head_id_field,
+            tail_id_field=tail_id_field,
+            relation_field=relation_field,
+            relation_type_id_field=relation_type_id_field,
+            relation_type_name_field=relation_type_name_field,
+        )
+        batch_size = schema.batch_size
+        entity_index = schema.entity_index
+        relation_index = schema.relation_index
+        relation_type_index = schema.relation_type_index
+        entity_id_field = schema.entity_id_field
+        entity_name_field = schema.entity_name_field
+        head_id_field = schema.head_id_field
+        tail_id_field = schema.tail_id_field
+        relation_field = schema.relation_field
+        relation_type_id_field = schema.relation_type_id_field
+        relation_type_name_field = schema.relation_type_name_field
+
         logger.info("=" * 60)
         logger.info("开始从 ES 读取知识图谱数据...")
         logger.info("实体索引: %s,  关系索引: %s,  关系类型索引: %s",

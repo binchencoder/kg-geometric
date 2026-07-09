@@ -8,17 +8,19 @@
 
 from __future__ import annotations
 
+import json
+import os
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 
 import torch
 
-from src.core.config import logger
+from src.core.config import logger, ESConfig, KnowledgeGraphSchema
 from src.core.types import Triple
 
 
-class KGFaultDataset:
-    """车辆故障知识图谱数据集。
+class KGTripleDataset:
+    """知识图谱三元组数据集。
 
     数据源优先级：ES 实时查询 → 内置 CVFFAD 示例数据。
 
@@ -59,44 +61,57 @@ class KGFaultDataset:
     def __init__(
             self,
             es_config: ESConfig,
-            graph_id: str = "992504969637961728",
-            ontology_id: str = "992355151124930560",
-            es_entity_index: str = "knowledge_entity_index",
-            es_relation_index: str = "knowledge_entity_relation_index",
-            es_relation_type_index: str = "knowledge_entity_type_relation_index",
-            es_batch_size: int = 5000,
-            es_head_field: str = "srcEntityId",
-            es_relation_field: str = "relationTypeId",
-            es_tail_field: str = "dstEntityId",
-            es_entity_id_field: str = "entityId",
-            es_entity_name_field: str = "name",
-            es_relation_type_id_field: str = "relationTypeId",
-            es_relation_type_name_field: str = "name",
+            graph_id: Optional[str] = None,
+            ontology_id: Optional[str] = None,
+            es_entity_index: Optional[str] = None,
+            es_relation_index: Optional[str] = None,
+            es_relation_type_index: Optional[str] = None,
+            es_batch_size: Optional[int] = None,
+            es_head_field: Optional[str] = None,
+            es_relation_field: Optional[str] = None,
+            es_tail_field: Optional[str] = None,
+            es_entity_id_field: Optional[str] = None,
+            es_entity_name_field: Optional[str] = None,
+            es_relation_type_id_field: Optional[str] = None,
+            es_relation_type_name_field: Optional[str] = None,
             use_builtin_example: bool = False,
     ) -> None:
+        # 从 config/config.yaml 加载默认值，显式传入将覆盖 YAML 配置
+        schema = KnowledgeGraphSchema.default().override(
+            graph_id=graph_id,
+            ontology_id=ontology_id,
+            batch_size=es_batch_size,
+            entity_index=es_entity_index,
+            relation_index=es_relation_index,
+            relation_type_index=es_relation_type_index,
+            entity_id_field=es_entity_id_field,
+            entity_name_field=es_entity_name_field,
+            head_id_field=es_head_field,
+            tail_id_field=es_tail_field,
+            relation_field=es_relation_field,
+            relation_type_id_field=es_relation_type_id_field,
+            relation_type_name_field=es_relation_type_name_field,
+        )
+
         if not use_builtin_example:
-            try:
-                self.triples = self._load_from_es(
-                    graph_id=graph_id,
-                    ontology_id=ontology_id,
-                    entity_index=es_entity_index,
-                    relation_index=es_relation_index,
-                    relation_type_index=es_relation_type_index,
-                    batch_size=es_batch_size,
-                    head_field=es_head_field,
-                    relation_field=es_relation_field,
-                    tail_field=es_tail_field,
-                    entity_id_field=es_entity_id_field,
-                    entity_name_field=es_entity_name_field,
-                    relation_type_id_field=es_relation_type_id_field,
-                    relation_type_name_field=es_relation_type_name_field,
-                )
-                self._data_source = "elasticsearch"
-                logger.info("从 ES 加载三元组完成: %d 条", len(self.triples))
-            except Exception as e:
-                logger.warning("从 ES 加载失败 (%s)，回退到内置示例数据", e)
-                self.triples = self._hardcoded_triples()
-                self._data_source = "builtin"
+            self.triples = self._load_from_es(
+                es_config=es_config,
+                graph_id=schema.graph_id,
+                ontology_id=schema.ontology_id,
+                entity_index=schema.entity_index,
+                relation_index=schema.relation_index,
+                relation_type_index=schema.relation_type_index,
+                batch_size=schema.batch_size,
+                head_field=schema.head_id_field,
+                relation_field=schema.relation_field,
+                tail_field=schema.tail_id_field,
+                entity_id_field=schema.entity_id_field,
+                entity_name_field=schema.entity_name_field,
+                relation_type_id_field=schema.relation_type_id_field,
+                relation_type_name_field=schema.relation_type_name_field,
+            )
+            self._data_source = "elasticsearch"
+            logger.info("从 ES 加载三元组完成: %d 条", len(self.triples))
         else:
             self.triples = self._hardcoded_triples()
             self._data_source = "builtin"
@@ -136,31 +151,28 @@ class KGFaultDataset:
 
     @staticmethod
     def _load_from_es(
+            es_config: ESConfig,
             graph_id: str,
             ontology_id: str,
-            batch_size: int = 5000,
-            entity_index: str = "knowledge_entity_index",
-            relation_index: str = "knowledge_entity_relation_index",
-            relation_type_index: str = "knowledge_entity_type_relation_index",
-            head_field: str = "srcEntityId",
-            relation_field: str = "relationTypeId",
-            tail_field: str = "dstEntityId",
-            entity_id_field: str = "entityId",
-            entity_name_field: str = "name",
-            relation_type_id_field: str = "relationTypeId",
-            relation_type_name_field: str = "name",
+            batch_size: Optional[int] = None,
+            entity_index: Optional[str] = None,
+            relation_index: Optional[str] = None,
+            relation_type_index: Optional[str] = None,
+            head_field: Optional[str] = None,
+            relation_field: Optional[str] = None,
+            tail_field: Optional[str] = None,
+            entity_id_field: Optional[str] = None,
+            entity_name_field: Optional[str] = None,
+            relation_type_id_field: Optional[str] = None,
+            relation_type_name_field: Optional[str] = None,
     ) -> List[Triple]:
         """从 Elasticsearch 加载三元组。
 
-        使用 ESKnowledgeGraphReader 三步查询法：
-        1. 读取实体索引 → entityId → name 映射
-        2. 读取关系类型索引 → relationTypeId → name 映射
-        3. 读取关系索引 → 解析为 Triple 列表
+        索引名/字段名默认从 ``config/config.yaml`` 加载，显式传入将覆盖 YAML 配置。
         """
         from src.es.reader import ESKnowledgeGraphReader
 
-        reader = ESKnowledgeGraphReader()
-        try:
+        with ESKnowledgeGraphReader(es_config) as reader:
             triples = reader.fetch_triples(
                 graph_id=graph_id,
                 ontology_id=ontology_id,
@@ -179,134 +191,41 @@ class KGFaultDataset:
             if not triples:
                 raise ValueError("ES 查询结果为空（无三元组）")
             return triples
-        finally:
-            reader.close()
 
     @staticmethod
     def _hardcoded_triples() -> List[Triple]:
-        """内置 CVFFAD 示例三元组（用于离线/单测/ES 不可用时的回退）。"""
-        return [
-            # ================================================================
-            # 发动机启动困难
-            # ================================================================
-            Triple("发动机启动困难", "属于系统", "动力系统"),
-            Triple("发动机启动困难", "属于类别", "启动系统"),
-            Triple("发动机启动困难", "表现为", "早上启动困难，需要多次尝试"),
-            Triple("发动机启动困难", "表现为", "启动时仪表盘闪烁然后熄灭"),
-            Triple("发动机启动困难", "表现为", "启动时有吱吱异响"),
-            Triple("发动机启动困难", "表现为", "冷车启动困难，热车正常"),
-            Triple("发动机启动困难", "由...引起", "蓄电池电量不足"),
-            Triple("发动机启动困难", "由...引起", "启动机故障"),
-            Triple("发动机启动困难", "由...引起", "点火系统故障"),
-            Triple("发动机启动困难", "由...引起", "燃油系统供油不畅"),
-            Triple("发动机启动困难", "维修措施", "更换蓄电池"),
-            Triple("发动机启动困难", "维修措施", "检修启动机"),
-            Triple("发动机启动困难", "维修措施", "更换火花塞"),
-            Triple("发动机启动困难", "维修措施", "清洗喷油嘴"),
-            Triple("发动机启动困难", "需要工具", "万用表"),
-            Triple("发动机启动困难", "需要工具", "蓄电池检测仪"),
-            # ================================================================
-            # 发动机怠速不稳
-            # ================================================================
-            Triple("发动机怠速不稳", "属于系统", "动力系统"),
-            Triple("发动机怠速不稳", "属于类别", "怠速系统"),
-            Triple("发动机怠速不稳", "表现为", "发动机怠速时抖动明显"),
-            Triple("发动机怠速不稳", "表现为", "怠速转速忽高忽低不稳定"),
-            Triple("发动机怠速不稳", "表现为", "等红灯时感觉车身不停颤抖"),
-            Triple("发动机怠速不稳", "表现为", "怠速时发动机转速波动大"),
-            Triple("发动机怠速不稳", "由...引起", "节气门积碳"),
-            Triple("发动机怠速不稳", "由...引起", "怠速马达故障"),
-            Triple("发动机怠速不稳", "由...引起", "进气系统漏气"),
-            Triple("发动机怠速不稳", "由...引起", "燃油压力不稳"),
-            Triple("发动机怠速不稳", "维修措施", "清洗节气门体"),
-            Triple("发动机怠速不稳", "维修措施", "更换怠速马达"),
-            Triple("发动机怠速不稳", "维修措施", "检修进气系统"),
-            Triple("发动机怠速不稳", "维修措施", "更换燃油泵"),
-            Triple("发动机怠速不稳", "需要工具", "诊断仪"),
-            Triple("发动机怠速不稳", "需要工具", "转速表"),
-            # ================================================================
-            # 发动机动力不足
-            # ================================================================
-            Triple("发动机动力不足", "属于系统", "动力系统"),
-            Triple("发动机动力不足", "属于类别", "燃烧系统"),
-            Triple("发动机动力不足", "表现为", "发动机沉闷，排气冒黑烟"),
-            Triple("发动机动力不足", "表现为", "加速迟缓，超车困难"),
-            Triple("发动机动力不足", "表现为", "上坡时动力明显不足，转速上不去"),
-            Triple("发动机动力不足", "表现为", "急加速时进气管有嘶嘶声"),
-            Triple("发动机动力不足", "由...引起", "空气滤清器堵塞"),
-            Triple("发动机动力不足", "由...引起", "涡轮增压器故障"),
-            Triple("发动机动力不足", "由...引起", "燃油系统压力不足"),
-            Triple("发动机动力不足", "由...引起", "气缸压缩不足"),
-            Triple("发动机动力不足", "维修措施", "更换空气滤清器"),
-            Triple("发动机动力不足", "维修措施", "更换涡轮增压器"),
-            Triple("发动机动力不足", "维修措施", "检修燃油系统"),
-            Triple("发动机动力不足", "维修措施", "发动机大修"),
-            Triple("发动机动力不足", "需要工具", "诊断仪"),
-            Triple("发动机动力不足", "需要工具", "内窥镜"),
-            Triple("发动机动力不足", "需要工具", "烟度计"),
-            # ================================================================
-            # 发动机过热
-            # ================================================================
-            Triple("发动机过热", "属于系统", "动力系统"),
-            Triple("发动机过热", "属于类别", "冷却系统"),
-            Triple("发动机过热", "表现为", "发动机舱冒出大量白色蒸汽"),
-            Triple("发动机过热", "表现为", "水温表指针进入红色区域"),
-            Triple("发动机过热", "表现为", "暖风不热"),
-            Triple("发动机过热", "表现为", "冷却液液位下降快"),
-            Triple("发动机过热", "由...引起", "冷却液泄漏"),
-            Triple("发动机过热", "由...引起", "散热器堵塞"),
-            Triple("发动机过热", "由...引起", "水泵故障"),
-            Triple("发动机过热", "由...引起", "节温器失效"),
-            Triple("发动机过热", "维修措施", "更换散热器"),
-            Triple("发动机过热", "维修措施", "更换水泵"),
-            Triple("发动机过热", "维修措施", "更换节温器"),
-            Triple("发动机过热", "维修措施", "检修冷却系统管路"),
-            Triple("发动机过热", "需要工具", "红外测温仪"),
-            Triple("发动机过热", "需要工具", "冷却系统压力仪"),
-            # ================================================================
-            # 机油压力异常
-            # ================================================================
-            Triple("机油压力异常", "属于系统", "动力系统"),
-            Triple("机油压力异常", "属于类别", "润滑系统"),
-            Triple("机油压力异常", "表现为", "机油压力报警灯闪烁"),
-            Triple("机油压力异常", "表现为", "发动机运行时异响增大"),
-            Triple("机油压力异常", "表现为", "机油消耗量异常增加"),
-            Triple("机油压力异常", "表现为", "排气管冒蓝烟"),
-            Triple("机油压力异常", "由...引起", "机油泵磨损"),
-            Triple("机油压力异常", "由...引起", "机油滤清器堵塞"),
-            Triple("机油压力异常", "由...引起", "轴承间隙过大"),
-            Triple("机油压力异常", "由...引起", "机油粘度不合适"),
-            Triple("机油压力异常", "维修措施", "更换机油泵"),
-            Triple("机油压力异常", "维修措施", "更换机油滤清器"),
-            Triple("机油压力异常", "维修措施", "更换轴承"),
-            Triple("机油压力异常", "维修措施", "更换合适粘度机油"),
-            Triple("机油压力异常", "需要工具", "机油压力表"),
-            # ================================================================
-            # 离合器打滑
-            # ================================================================
-            Triple("离合器打滑", "属于系统", "传动系统"),
-            Triple("离合器打滑", "属于类别", "离合器系统"),
-            Triple("离合器打滑", "表现为", "起步时发动机转速升高但车速不提"),
-            Triple("离合器打滑", "表现为", "爬坡时动力传递不畅"),
-            Triple("离合器打滑", "表现为", "加速时有焦糊味"),
-            Triple("离合器打滑", "表现为", "离合器踏板行程变长"),
-            Triple("离合器打滑", "由...引起", "离合器片磨损"),
-            Triple("离合器打滑", "由...引起", "压盘弹簧疲劳"),
-            Triple("离合器打滑", "由...引起", "离合器踏板自由行程不当"),
-            Triple("离合器打滑", "由...引起", "离合器油液不足"),
-            Triple("离合器打滑", "维修措施", "更换离合器片"),
-            Triple("离合器打滑", "维修措施", "更换压盘"),
-            Triple("离合器打滑", "维修措施", "调整踏板行程"),
-            Triple("离合器打滑", "维修措施", "补充离合器油"),
-            Triple("离合器打滑", "需要工具", "诊断仪"),
-            # ================================================================
-            # 变速箱换挡顿挫
-            # ================================================================
-            Triple("变速箱换挡顿挫", "属于系统", "传动系统"),
-            Triple("变速箱换挡顿挫", "属于类别", "变速箱系统"),
-            Triple("变速箱换挡顿挫", "表现为", "换挡时车身明显闯动"),
-            Triple("变速箱换挡顿挫", "表现为", "自动变速箱升档延迟"),
-        ]
+        """从同目录的 JSON 知识库加载内置示例三元组。
+
+        JSON 结构: [{"head": "...", "relation": "...", "tail": "..."}, ...]
+        文件路径: ``src/dataset/fault_knowledge_base.json``
+        """
+        kb_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "fault_knowledge_base.json",
+        )
+        try:
+            with open(kb_path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+        except FileNotFoundError:
+            logger.warning(
+                "知识库文件不存在: %s，返回空列表", kb_path,
+            )
+            return []
+        except json.JSONDecodeError as e:
+            logger.warning("知识库 JSON 解析失败: %s", e)
+            return []
+
+        triples: List[Triple] = []
+        for item in raw:
+            try:
+                triples.append(
+                    Triple(str(item["head"]), str(item["relation"]), str(item["tail"]))
+                )
+            except KeyError as e:
+                logger.warning("跳过缺失字段 %s 的三元组: %s", e, item)
+                continue
+        logger.info("从 %s 加载内置示例三元组: %d 条", kb_path, len(triples))
+        return triples
 
     # ================================================================
     # 构建方法

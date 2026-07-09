@@ -204,7 +204,7 @@ def _create_streamer(args, resolver) -> "ESTripletStreamer":
     """创建 ESTripletStreamer 实例。"""
     from src.es import ESTripletStreamer
 
-    config = ESConfig()
+    config = ESConfig.default()
     index_names = args.index if len(args.index) > 1 else args.index[0]
     logger.info("创建 ES Streamer，目标索引: %s", index_names)
 
@@ -253,7 +253,7 @@ def _load_triples_demo() -> list:
 
 def _load_triples_from_es(args) -> list:
     """从 ES 流式读取全部三元组到内存。"""
-    config = ESConfig()
+    config = ESConfig.default()
     resolver = _build_resolver(args, config)
     streamer = _create_streamer(args, resolver)
     extra_filters = _get_extra_filters(args)
@@ -307,7 +307,7 @@ def _build_streaming_data_and_sampler(args):
     """
     from src.graph.sampler import AsyncSubgraphSampler
 
-    config = ESConfig()
+    config = ESConfig.default()
     resolver = _build_resolver(args, config)
     streamer = _create_streamer(args, resolver)
     extra_filters = _get_extra_filters(args)

@@ -1,15 +1,26 @@
-import pandas as pd
+import os
+import sys
+
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import os
-from torch_geometric.data import HeteroData
-from torch_geometric.nn import RGCNConv, Linear, HeteroConv, SAGEConv
-from torch_geometric.nn.models.tgn import TGNMemory, IdentityMessage, LastAggregator, TimeEncoder
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, mean_absolute_error
-import copy
+from sklearn.model_selection import train_test_split
+from torch_geometric.data import HeteroData
+from torch_geometric.nn import RGCNConv, Linear
+
+# 允许以脚本方式直接运行（`python demo/fault_prediction.py`）
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+from src.model import TGNOilTemperaturePredict  # noqa: E402
+from src.model.training import (  # noqa: E402
+    train_joint_rgcn_tgn,
+    train_tgn,
+)
 
 # ===================== 全局配置 =====================
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -183,278 +194,91 @@ class RGCNFaultDiagnosis(torch.nn.Module):
 
 
 # ===================== 4. 模型2：TGN 时序趋势预测模型 =====================
-class TGN(torch.nn.Module):
-    """Temporal Graph Network：基于节点记忆 + 时序编码 + 异构图卷积的时序预测模型"""
-
-    def __init__(self, in_channels, hidden_channels, out_channels, edge_types,
-                 num_layers, num_time_slices):
-        super().__init__()
-        # 余弦时序编码器（比线性编码更能捕获周期模式）
-        self.time_enc = TimeEncoder(hidden_channels)
-        # TGN 记忆模块：index 0=transformer, index 1..N=time_slice
-        self.memory = TGNMemory(
-            num_nodes=num_time_slices + 1,
-            raw_msg_dim=hidden_channels,
-            memory_dim=hidden_channels,
-            time_dim=hidden_channels,
-            message_module=IdentityMessage(hidden_channels, hidden_channels, hidden_channels),
-            aggregator_module=LastAggregator(),
-        )
-        # PyG 默认将 last_update 创建为 Long，_reset_message_store 也将空时间戳初始化为 Long；
-        # 但我们使用 Float 时间戳。为避免 eval() 触发 _update_memory 时 Long→Float 写入不匹配，
-        # 这里将 last_update 改为 Float，并同步将 msg_store 中的空时间戳统一转为 Float。
-        self.memory.register_buffer('last_update', self.memory.last_update.float())
-        for _store in (self.memory.msg_s_store, self.memory.msg_d_store):
-            for _j in range(self.memory.num_nodes):
-                _s, _d, _t, _m = _store[_j]
-                _store[_j] = (_s, _d, _t.float(), _m)
-        # 节点特征投影
-        self.node_proj = nn.ModuleDict({
-            node_type: Linear(in_dim, hidden_channels)
-            for node_type, in_dim in in_channels.items()
-        })
-        # 多层异构图卷积
-        self.convs = nn.ModuleList()
-        for _ in range(num_layers):
-            conv = HeteroConv({
-                edge_type: SAGEConv((-1, -1), hidden_channels)
-                for edge_type in edge_types
-            }, aggr='mean')
-            self.convs.append(conv)
-        # 输出投影
-        self.out_proj = nn.ModuleDict({
-            node_type: Linear(hidden_channels, out_channels)
-            for node_type in in_channels.keys()
-        })
-
-    def forward(self, x_dict, edge_index_dict, edge_time_dict=None):
-        device = x_dict["time_slice"].device
-        # 投影到隐空间
-        x_dict = {k: self.node_proj[k](v) for k, v in x_dict.items()}
-        # TGN 时序记忆更新
-        if edge_time_dict is not None:
-            # 1) detach 记忆状态，断开与上一轮 forward/backward 计算图的连接，
-            #    避免 "Trying to backward through the graph a second time" 错误。
-            if hasattr(self.memory, 'detach'):
-                self.memory.detach()
-            if hasattr(self.memory, 'memory') and self.memory.memory is not None:
-                self.memory.memory = self.memory.memory.detach()
-            if hasattr(self.memory, 'last_update') and self.memory.last_update is not None:
-                self.memory.last_update = self.memory.last_update.detach()
-            # 2) 重置记忆与消息存储，保证本轮 forward 的因果性。
-            self.memory.reset_state()
-            # PyG TGNMemory._reset_message_store 将 msg_store 中的空时间戳初
-            # 始化为 Long，与 self.last_update (Long) 保持一致。但若传入 Float
-            # 时间戳，_compute_msg 中 cat(empty_Long, float_data) 会因 dtype
-            # 不同而失败。这里将 msg_store 的空时间戳统一转为 Float 以避免冲突。
-            for store in (self.memory.msg_s_store, self.memory.msg_d_store):
-                for j in range(self.memory.num_nodes):
-                    s, d, t, m = store[j]
-                    store[j] = (s, d, t.float(), m)
-            for edge_type, edge_time in edge_time_dict.items():
-                src_type, _, dst_type = edge_type
-                edge_index = edge_index_dict[edge_type]
-                src, dst = edge_index[0], edge_index[1]
-                # 映射索引：transformer→0, time_slice i→i+1 (memory 中保留 slot 0 给 transformer)
-                if src_type == "transformer":
-                    src_mapped = torch.zeros(len(src), dtype=torch.long, device=device)
-                else:  # src_type == "time_slice"
-                    src_mapped = src + 1
-                if dst_type == "transformer":
-                    dst_mapped = torch.zeros(len(dst), dtype=torch.long, device=device)
-                else:  # dst_type == "time_slice"
-                    dst_mapped = dst + 1
-                # 按时序排序，保证时间因果性
-                time_order = edge_time.argsort()
-                src_mapped = src_mapped[time_order]
-                dst_mapped = dst_mapped[time_order]
-                t_sorted = edge_time[time_order].float()
-                # 构造时序消息：源节点特征 + 时间编码
-                time_emb = self.time_enc(t_sorted.unsqueeze(-1))
-                raw_msg = x_dict[src_type][src[time_order]] + time_emb
-                # 更新 TGN 节点记忆
-                self.memory.update_state(src_mapped, dst_mapped, t_sorted, raw_msg)
-            # 提取 time_slice 节点的最新记忆并注入特征
-            num_slices = x_dict["time_slice"].shape[0]
-            time_indices = torch.arange(1, num_slices + 1, device=device)
-            mem_z, _ = self.memory(time_indices)
-            x_dict["time_slice"] = x_dict["time_slice"] + mem_z
-        # 逐层异构图卷积（HeteroConv 只输出目标节点，需保留仅作源节点的类型）
-        for conv in self.convs:
-            prev = x_dict
-            x_dict = conv(x_dict, edge_index_dict)
-            # 恢复未被更新的节点类型（如 transformer 仅作源节点，不会出现在输出中）
-            for k, v in prev.items():
-                if k not in x_dict:
-                    x_dict[k] = v
-            x_dict = {k: F.relu(v) for k, v in x_dict.items()}
-        # 输出投影
-        out_dict = {k: self.out_proj[k](v) for k, v in x_dict.items()}
-        return out_dict
+# TGN 模型核心已抽取到 src/model/tgn.py，这里封装一个便捷工厂函数。
 
 
-class TGNOilTemperaturePredict(torch.nn.Module):
-    def __init__(self, hidden_dim, num_time_slices):
-        super().__init__()
-        self.gnn = TGN(
-            in_channels={
-                "transformer": 3,
-                "time_slice": FEATURE_NUM,
-                "health_state": 4,
-                "feature_indicator": 2
-            },
-            hidden_channels=hidden_dim,
-            out_channels=hidden_dim,
-            edge_types=[
-                ("transformer", "has_time_slice", "time_slice"),
-                ("time_slice", "next", "time_slice"),        # 相邻时序边
-                ("time_slice", "has_health_state", "health_state"),
-                ("time_slice", "has_feature", "feature_indicator"),
-                ("health_state", "state_has_symbol", "feature_indicator"),
-            ],
-            num_layers=2,
-            num_time_slices=num_time_slices,
-        )
-        # 油温预测头：将 GNN embedding 与原始 OT 特征做 skip-connection
-        # 这样模型至少能达到 "用当前油温预测未来油温" 的基线水平
-        self.ot_head = nn.Sequential(
-            Linear(hidden_dim + 1, 16),
-            nn.ReLU(),
-            Linear(16, 1)
-        )
-        # 故障风险预测头
-        self.risk_head = nn.Sequential(
-            Linear(hidden_dim, 16),
-            nn.ReLU(),
-            Linear(16, 1),
-            nn.Sigmoid()
-        )
+def build_tgn_oil_temperature_predict(hidden_dim, num_time_slices):
+    """构建一个用于变压器时序异构图的 TGN 油温预测模型。
 
-    def forward(self, hetero_data):
-        # edge_time_dict 同时包含 transformer->slice 边与 slice->next->slice 边
-        edge_time_dict = {
-            ("transformer", "has_time_slice", "time_slice"):
-                hetero_data["transformer", "has_time_slice", "time_slice"].edge_time,
-            ("time_slice", "next", "time_slice"):
-                hetero_data["time_slice", "next", "time_slice"].edge_time,
-        }
-        emb_dict = self.gnn(
-            x_dict=hetero_data.x_dict,
-            edge_index_dict=hetero_data.edge_index_dict,
-            edge_time_dict=edge_time_dict,
-        )
-        slice_emb = emb_dict["time_slice"]
-        # Skip-connection：将标准化后的 OT 特征直接拼接到 embedding，
-        # 保证模型至少能达到 "用当前油温预测未来油温" 的基线水平
-        ot_feature = hetero_data["time_slice"].x[:, -1].unsqueeze(-1)  # 最后一列是 OT (z-score)
-        ot_input = torch.cat([slice_emb, ot_feature], dim=-1)
-        future_ot = self.ot_head(ot_input)
-        fault_risk = self.risk_head(slice_emb)
-        return future_ot, fault_risk, slice_emb
+    配置与原脚本保持完全一致，包括节点输入维度、边类型与预测头结构。
+    """
+    return TGNOilTemperaturePredict(
+        in_channels={
+            "transformer": 3,
+            "time_slice": FEATURE_NUM,
+            "health_state": 4,
+            "feature_indicator": 2,
+        },
+        edge_types=[
+            ("transformer", "has_time_slice", "time_slice"),
+            ("time_slice", "next", "time_slice"),
+            ("time_slice", "has_health_state", "health_state"),
+            ("time_slice", "has_feature", "feature_indicator"),
+            ("health_state", "state_has_symbol", "feature_indicator"),
+        ],
+        temporal_edge_types=[
+            ("transformer", "has_time_slice", "time_slice"),
+            ("time_slice", "next", "time_slice"),
+        ],
+        hidden_dim=hidden_dim,
+        num_time_slices=num_time_slices,
+        num_layers=2,
+        ot_feature_index=-1,
+    )
 
 
 # ===================== 5. 完整训练循环 =====================
-def train_two_models(kg_graph, hold_out_n=5):
-    """联合训练 R-GCN + TGN 双模型。
+def train_two_models(kg_graph, hold_out_n=5, model_dir="./trained_models"):
+    """编排：切分数据 + 调用 src.model.training.train_joint_rgcn_tgn + 保存权重。
 
     参数:
         kg_graph: 异构图数据
-        hold_out_n: 从数据集尾部预留 N 个切片，既不参与训练也不参与测试，
-                    作为"未知样本"（用于验证模型在完全未见数据上的表现）。
+        hold_out_n: 从数据集尾部预留 N 个切片，既不参与训练也不参与测试
+        model_dir:   权重文件保存目录
 
     返回:
         diag_model, tgn_model, test_idx, hold_out_idx
     """
     total_num = kg_graph["time_slice"].x.shape[0]
-    # 将最后 hold_out_n 个切片作为"未知样本"，从 train/test 切分中剔除
     available = np.arange(total_num - hold_out_n)
     hold_out_idx = np.arange(total_num - hold_out_n, total_num)
-    train_idx, test_idx = train_test_split(available, test_size=0.2, random_state=42)
+    train_idx, test_idx = train_test_split(
+        available, test_size=0.2, random_state=42,
+    )
     train_idx = torch.tensor(train_idx, dtype=torch.long).to(DEVICE)
     test_idx = torch.tensor(test_idx, dtype=torch.long).to(DEVICE)
     hold_out_idx = torch.tensor(hold_out_idx, dtype=torch.long).to(DEVICE)
 
     # 初始化双模型
-    num_time_slices = kg_graph["time_slice"].x.shape[0]
+    num_time_slices = total_num
     diag_model = RGCNFaultDiagnosis(HIDDEN_DIM, HEALTH_NUM).to(DEVICE)
-    tgn_model = TGNOilTemperaturePredict(HIDDEN_DIM, num_time_slices).to(DEVICE)
-    # 优化器与损失函数
-    optimizer = torch.optim.Adam(list(diag_model.parameters()) + list(tgn_model.parameters()), lr=LR)
-    loss_cls = nn.CrossEntropyLoss()
-    loss_ot = nn.MSELoss()
-    loss_risk = nn.BCELoss()
+    tgn_model = build_tgn_oil_temperature_predict(HIDDEN_DIM, num_time_slices).to(DEVICE)
 
-    best_diag_acc = 0.0
-    best_ot_mae = float("inf")
-    best_diag_state = None
-    best_tgn_state = None
+    # 联合训练（TGN 训练循环已抽取到 src.model.training.train_joint_rgcn_tgn）
+    diag_model, tgn_model, metrics = train_joint_rgcn_tgn(
+        diag_model=diag_model,
+        tgn_model=tgn_model,
+        hetero_data=kg_graph,
+        train_idx=train_idx,
+        test_idx=test_idx,
+        epochs=EPOCHS,
+        lr=LR,
+        log_interval=10,
+        hold_out_n=hold_out_n,
+        verbose=True,
+    )
 
-    print("\n===== 开始联合训练 R-GCN故障诊断 + TGN时序趋势预测 =====")
-    for epoch in range(EPOCHS):
-        diag_model.train()
-        tgn_model.train()
-        optimizer.zero_grad()
+    # 保存模型文件
+    os.makedirs(model_dir, exist_ok=True)
+    torch.save(
+        diag_model.state_dict(),
+        os.path.join(model_dir, "transformer_fault_diag_rgcn.pth"),
+    )
+    torch.save(
+        tgn_model.state_dict(),
+        os.path.join(model_dir, "transformer_trend_tgn.pth"),
+    )
 
-        # 前向传播
-        health_logits, _ = diag_model(kg_graph.x_dict, kg_graph.edge_index_dict)
-        future_ot_pred, fault_risk_pred, _ = tgn_model(kg_graph)
-
-        # 计算多任务损失
-        loss1 = loss_cls(health_logits[train_idx], kg_graph["time_slice"].y_health[train_idx])
-        # loss2 使用 z-score 化的目标：让油温回归任务的 loss 量级与分类任务可比 (~1.0 vs ~0.1)
-        # 否则 MSE 在摄氏度尺度上约 100，而 CrossEntropy 约 0.001，完全淹没分类信号
-        ot_mean = kg_graph["time_slice"].ot_mean
-        ot_std = kg_graph["time_slice"].ot_std
-        loss2 = loss_ot(future_ot_pred.squeeze()[train_idx], kg_graph["time_slice"].y_future_ot_norm[train_idx])
-        # 风险标签：严重过热/过载故障为高风险1，其他为0
-        risk_label = (kg_graph["time_slice"].y_health >= 2).float()
-        loss3 = loss_risk(fault_risk_pred.squeeze()[train_idx], risk_label[train_idx])
-        total_loss = loss1 + loss2 + loss3
-
-        total_loss.backward()
-        optimizer.step()
-
-        # 评估精度（无需 eval()，TGN 切换会触发 msg_store 刷新导致二次 backward）
-        with torch.no_grad():
-            # 诊断精度
-            pred_health = torch.argmax(health_logits, dim=1)
-            diag_acc = accuracy_score(
-                kg_graph["time_slice"].y_health[test_idx].cpu().numpy(),
-                pred_health[test_idx].cpu().numpy()
-            )
-            # 油温预测MAE：反标准化回摄氏度再评估
-            future_ot_celsius = future_ot_pred.squeeze().detach() * ot_std + ot_mean
-            ot_mae = mean_absolute_error(
-                kg_graph["time_slice"].y_future_ot[test_idx].cpu().numpy(),
-                future_ot_celsius[test_idx].cpu().numpy()
-            )
-            # 风险预测精度
-            risk_pred = (fault_risk_pred.squeeze() >= 0.5).float()
-            risk_acc = accuracy_score(
-                risk_label[test_idx].cpu().numpy(),
-                risk_pred[test_idx].cpu().numpy()
-            )
-
-        # 保存最优模型（state_dict 方式，避免 deepcopy 报错）
-        if diag_acc > best_diag_acc:
-            best_diag_acc = diag_acc
-            best_diag_state = copy.deepcopy(diag_model.state_dict())
-        if ot_mae < best_ot_mae:
-            best_ot_mae = ot_mae
-            best_tgn_state = copy.deepcopy(tgn_model.state_dict())
-
-        if (epoch + 1) % 10 == 0:
-            print(
-                f"Epoch:{epoch + 1:3d} | TotalLoss:{total_loss:.4f} | DiagAcc:{diag_acc:.4f} | OT_MAE:{ot_mae:.4f} | RiskAcc:{risk_acc:.4f}")
-
-    # 保存模型文件 & 恢复最优权重
-    os.makedirs("./trained_models", exist_ok=True)
-    torch.save(best_diag_state, "./trained_models/transformer_fault_diag_rgcn.pth")
-    torch.save(best_tgn_state, "./trained_models/transformer_trend_tgn.pth")
-    diag_model.load_state_dict(best_diag_state)
-    tgn_model.load_state_dict(best_tgn_state)
-    print(f"\n训练完成！最优故障诊断准确率: {best_diag_acc:.4f}，最优油温预测MAE: {best_ot_mae:.4f}")
-    print(f"预留未知样本数: {hold_out_idx.shape[0]}（既不参与训练也不参与测试）")
     return diag_model, tgn_model, test_idx, hold_out_idx
 
 
@@ -556,7 +380,7 @@ if __name__ == "__main__":
     else:
         total_num = kg_graph["time_slice"].x.shape[0]
         diag_model = RGCNFaultDiagnosis(HIDDEN_DIM, HEALTH_NUM).to(DEVICE)
-        tgn_model = TGNOilTemperaturePredict(HIDDEN_DIM, total_num).to(DEVICE)
+        tgn_model = build_tgn_oil_temperature_predict(HIDDEN_DIM, total_num).to(DEVICE)
         print(f"加载故障诊断模型：{diag_path}")
         diag_model.load_state_dict(torch.load(diag_path, map_location=DEVICE, weights_only=True))
         diag_model.eval()

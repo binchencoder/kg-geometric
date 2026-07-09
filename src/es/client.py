@@ -25,7 +25,7 @@ def create_es_client(config: Optional[ESConfig] = None) -> Elasticsearch:
     -------
     Elasticsearch
     """
-    config = config or ESConfig()
+    config = config or ESConfig.default()
     return Elasticsearch(
         hosts=[{
             "host": config.host,

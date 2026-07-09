@@ -12,7 +12,7 @@ from typing import Dict, List, Optional
 import torch
 from torch_geometric.data import Data
 
-from src.core.config import logger
+from src.core.config import logger, KnowledgeGraphSchema
 from src.core.types import Triple
 
 
@@ -109,16 +109,18 @@ class TripleToDatasetConverter:
 
 
 def build_pipeline(
-         graph_id: str,
+        graph_id: str,
         ontology_id: str,
-        batch_size: int = 5000,
-        entity_index: str = "knowledge_entity_index",
-        relation_index: str = "knowledge_entity_relation_index",
-        relation_type_index: str = "knowledge_entity_type_relation_index",
+        batch_size: Optional[int] = None,
+        entity_index: Optional[str] = None,
+        relation_index: Optional[str] = None,
+        relation_type_index: Optional[str] = None,
         fault_nodes: Optional[List[str]] = None,
         **field_mapping,
 ) -> TripleToDatasetConverter:
     """一键构建：从 ES 读取 → 构建三元组 → 转换数据集。
+
+    索引名与字段名默认从 ``config/config.yaml`` 加载，显式传入的值将覆盖 YAML 配置。
 
     Returns
     -------
@@ -127,16 +129,33 @@ def build_pipeline(
     """
     from src.es.reader import ESKnowledgeGraphReader
 
-    reader = ESKnowledgeGraphReader()
-    try:
+    schema = KnowledgeGraphSchema.default().override(
+        batch_size=batch_size,
+        entity_index=entity_index,
+        relation_index=relation_index,
+        relation_type_index=relation_type_index,
+        **{k: v for k, v in field_mapping.items() if k in (
+            "entity_id_field", "entity_name_field",
+            "head_id_field", "tail_id_field", "relation_field",
+            "relation_type_id_field", "relation_type_name_field",
+        )},
+    )
+
+    with ESKnowledgeGraphReader() as reader:
         triples = reader.fetch_triples(
             graph_id=graph_id,
             ontology_id=ontology_id,
-            entity_index=entity_index,
-            relation_index=relation_index,
-            relation_type_index=relation_type_index,
-            batch_size=batch_size,
-            **field_mapping,
+            batch_size=schema.batch_size,
+            entity_index=schema.entity_index,
+            relation_index=schema.relation_index,
+            relation_type_index=schema.relation_type_index,
+            entity_id_field=schema.entity_id_field,
+            entity_name_field=schema.entity_name_field,
+            head_id_field=schema.head_id_field,
+            tail_id_field=schema.tail_id_field,
+            relation_field=schema.relation_field,
+            relation_type_id_field=schema.relation_type_id_field,
+            relation_type_name_field=schema.relation_type_name_field,
         )
         if not triples:
             raise ValueError("未能从 ES 提取到任何三元组，请检查索引名与字段映射")
@@ -144,6 +163,3 @@ def build_pipeline(
         converter = TripleToDatasetConverter(triples, fault_nodes=fault_nodes)
         logger.info("数据集构建完成:\n%s", converter.statistics())
         return converter
-
-    finally:
-        reader.close()

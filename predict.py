@@ -24,7 +24,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 
-from demo.kg_fault_diagnosis import FaultGCN, KGFaultDataset, topk_fault_diagnosis
+from src.core.config import ESConfig
+from demo.fault_diagnosis import FaultGCN, KGTripleDataset, topk_fault_diagnosis
 
 # ============================================================
 # 日志配置
@@ -246,7 +247,7 @@ class KGFaultModelHandler(ModelHandler):
         """
         self.device = device
         self.top_k = top_k
-        self.dataset: Optional[KGFaultDataset] = None
+        self.dataset: Optional[KGTripleDataset] = None
         self.data: Optional[Any] = None
 
     def load(self, model_path: str) -> Tuple[FaultGCN, dict]:
@@ -290,7 +291,7 @@ class KGFaultModelHandler(ModelHandler):
         model.eval()
 
         # 加载内置数据集（含图结构 edge_index / labels）
-        self.dataset = KGFaultDataset()
+        self.dataset = KGTripleDataset(es_config=ESConfig.default())
         self.data = self.dataset.to_data()
 
         # 对齐特征维度：KGFaultDataset 默认生成 torch.eye(num_nodes)，

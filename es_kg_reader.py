@@ -88,7 +88,7 @@ def _parse_args():
 
 def _run_legacy_mode(args) -> None:
     """模式 A: 传统 scroll/scan 模式（兼容旧代码 + 推理）。"""
-    config = ESConfig()
+    config = ESConfig.default()
     reader = ESKnowledgeGraphReader(config)
     try:
         logger.info("运行模式: legacy (scroll/scan)")
@@ -97,9 +97,6 @@ def _run_legacy_mode(args) -> None:
         triples = reader.fetch_triples(
             graph_id=args.graph_id,
             ontology_id=args.ontology_id,
-            entity_index="knowledge_entity_index",
-            relation_index="knowledge_entity_relation_index",
-            relation_type_index="knowledge_entity_type_relation_index",
             batch_size=args.batch_size,
         )
 
@@ -403,7 +400,7 @@ def main() -> None:
         return
 
     # 模式 B & C: search_after 流式架构
-    config = ESConfig()
+    config = ESConfig.default()
     resolver = _build_resolver(args, config)
     streamer, vocab, extra_filters = _build_vocabulary_and_streamer(args, config, resolver)
 

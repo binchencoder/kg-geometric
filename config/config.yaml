@@ -1,0 +1,45 @@
+# ============================================================
+# 全局配置文件 —— 知识图谱相关的所有参数集中在这里
+#
+# 修改此文件后无需改动任何 Python 代码，服务重启后生效。
+# ============================================================
+
+# -------------------- Elasticsearch 连接 --------------------
+elasticsearch:
+  host: "10.1.13.30"
+  port: 30920
+  username: "elastic"
+  password: "E1OfAx4Nf55513tU4i40eQbA"
+  scheme: "http"
+  timeout: 60
+  max_retries: 3
+  retry_on_timeout: true
+
+# -------------------- 知识图谱索引/字段映射 --------------------
+# 用于 ESKnowledgeGraphReader.fetch_triples / KGTripleDataset 的默认配置。
+# 当你的 ES 集群使用不同的命名约定时，只需在此处调整。
+knowledge_graph:
+  # 图谱标识
+  graph_id: "992504969637961728"
+  ontology_id: "992355151124930560"
+
+  # 批处理大小
+  batch_size: 5000
+
+  # 三个索引名
+  entity_index: "knowledge_entity_index"
+  relation_index: "knowledge_entity_relation_index"
+  relation_type_index: "knowledge_entity_type_relation_index"
+
+  # 实体索引字段
+  entity_id_field: "entityId"
+  entity_name_field: "name"
+
+  # 关系索引字段
+  head_id_field: "srcEntityId"
+  tail_id_field: "dstEntityId"
+  relation_field: "relationTypeId"
+
+  # 关系类型索引字段
+  relation_type_id_field: "relationTypeId"
+  relation_type_name_field: "name"

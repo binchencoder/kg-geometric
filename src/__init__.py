@@ -21,7 +21,7 @@ from .es import (
 )
 from .graph import (
     TripleToDatasetConverter, build_pipeline,
-    KGFaultDataset, KGNeighborLoaderAdapter, AsyncSubgraphSampler,
+    KGTripleDataset, KGNeighborLoaderAdapter, AsyncSubgraphSampler,
     LinkPredictionData, LinkPredictionStreamingData,
 )
 from .model import (
@@ -47,7 +47,7 @@ __all__ = [
     "ESTripletStreamer", "KGVocabulary",
     # graph
     "TripleToDatasetConverter", "build_pipeline",
-    "KGFaultDataset", "KGNeighborLoaderAdapter", "AsyncSubgraphSampler",
+    "KGTripleDataset", "KGNeighborLoaderAdapter", "AsyncSubgraphSampler",
     "LinkPredictionData", "LinkPredictionStreamingData",
     # model
     "FaultGCN", "FaultLabelBuilder", "split_masks", "train", "evaluate",

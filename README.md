@@ -14,7 +14,7 @@ conda activate kg-geometric-fault-diagnosis
 ## 运行示例
 
 ```bash
-python kg_fault_diagnosis.py
+python fault_diagnosis.py
 ```
 
 ## 说明

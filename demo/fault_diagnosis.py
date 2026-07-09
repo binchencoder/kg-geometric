@@ -7,12 +7,12 @@
 4. 结果组装：结构化诊断报告
 
 运行方式：
-    python demo/kg_fault_diagnosis.py
+    python demo/fault_diagnosis.py
 
     # 指定自定义症状
-    python demo/kg_fault_diagnosis.py --query "加速迟缓"
-    python demo/kg_fault_diagnosis.py --query "冒白烟" --top-k 5
-    python demo/kg_fault_diagnosis.py --query "抖动厉害"
+    python demo/fault_diagnosis.py --query "加速迟缓"
+    python demo/fault_diagnosis.py --query "冒白烟" --top-k 5
+    python demo/fault_diagnosis.py --query "抖动厉害"
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ import torch
 from src.model.rgcn import FaultRGCN
 from src.model.gcn import FaultGCN
 from src.model.training import split_masks, train_rgcn, train, evaluate
-from src.dataset.fault_dataset import KGFaultDataset
+from src.dataset.triple_dataset import KGTripleDataset
 from src.pipeline.inference import (
     infer_from_text,
     format_result,
@@ -34,7 +34,7 @@ from src.pipeline.inference import (
     DiagnosisResult,
 )
 from src.pipeline.diagnosis import topk_fault_diagnosis, print_topk_diagnosis
-from src.core.config import logger
+from src.core.config import logger, ESConfig
 
 # 固定随机种子
 SEED = 42
@@ -46,7 +46,7 @@ torch.manual_seed(SEED)
 __all__ = [
     "FaultGCN",
     "FaultRGCN",
-    "KGFaultDataset",
+    "KGTripleDataset",
     "split_masks",
     "train",
     "train_rgcn",
@@ -60,7 +60,7 @@ __all__ = [
 
 
 def run_training(
-        dataset: KGFaultDataset,
+        dataset: KGTripleDataset,
         hidden_dim: int = 64,
         num_layers: int = 2,
         dropout: float = 0.3,
@@ -73,7 +73,7 @@ def run_training(
 
     Parameters
     ----------
-    dataset : KGFaultDataset
+    dataset : KGTripleDataset
         知识图谱数据集（含 edge_index, edge_type, y）。
     hidden_dim : int
         隐藏层/嵌入维度。
@@ -174,7 +174,7 @@ def run_training(
 
 def run_inference(
         model: FaultRGCN,
-        dataset: KGFaultDataset,
+        dataset: KGTripleDataset,
         query: str,
         top_k_symptoms: int = 5,
         top_k_faults: int = 3,
@@ -185,7 +185,7 @@ def run_inference(
     ----------
     model : FaultRGCN
         训练好的 R-GCN 模型。
-    dataset : KGFaultDataset
+    dataset : KGTripleDataset
         知识图谱数据集。
     query : str
         用户输入的症状描述文本。
@@ -217,10 +217,10 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-  python demo/kg_fault_diagnosis.py
-  python demo/kg_fault_diagnosis.py --query "加速迟缓"
-  python demo/kg_fault_diagnosis.py --query "抖动" --top-k 5
-  python demo/kg_fault_diagnosis.py --query "水温表" --epochs 500
+  python demo/fault_diagnosis.py
+  python demo/fault_diagnosis.py --query "加速迟缓"
+  python demo/fault_diagnosis.py --query "抖动" --top-k 5
+  python demo/fault_diagnosis.py --query "水温表" --epochs 500
         """,
     )
     parser.add_argument("--query", default="发动机怠速不稳",
@@ -240,7 +240,7 @@ def main() -> None:
 
     # ---- 阶段 1: 加载数据集 ----
     print("\n📦 加载车辆故障知识图谱...")
-    dataset = KGFaultDataset()
+    dataset = KGTripleDataset(es_config=ESConfig.default())
     print(f"  数据源: {dataset._data_source}")
     print(f"  实体: {dataset.num_nodes}")
     print(f"  关系类型: {dataset.num_original_relations}")

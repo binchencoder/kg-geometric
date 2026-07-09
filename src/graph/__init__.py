@@ -11,7 +11,7 @@
 from src.dataset import (
     TripleToDatasetConverter,
     build_pipeline,
-    KGFaultDataset,
+    KGTripleDataset,
     LinkPredictionData,
     LinkPredictionStreamingData,
 )
@@ -21,7 +21,7 @@ from .sampler import AsyncSubgraphSampler
 __all__ = [
     "TripleToDatasetConverter",
     "build_pipeline",
-    "KGFaultDataset",
+    "KGTripleDataset",
     "KGNeighborLoaderAdapter",
     "AsyncSubgraphSampler",
     "LinkPredictionData",
