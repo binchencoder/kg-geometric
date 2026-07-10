@@ -43,18 +43,13 @@ from sklearn.model_selection import train_test_split  # noqa: E402
 from torch_geometric.data import HeteroData  # noqa: E402
 from typing import Optional  # noqa: E402
 
-from src.core.config import logger  # noqa: E402
+from src.core.config import load_health_mapping, logger  # noqa: E402
 
 # ---------------------------------------------------------------------------
-# 行业先验阈值（与 demo/fault_prediction.py 保持一致）
+# 健康状态标签映射（从 config/config.yaml 读取）
 # ---------------------------------------------------------------------------
 
-HEALTH_MAPPING: Dict[int, str] = {
-    0: "正常运行",
-    1: "轻微过热",
-    2: "严重过热",
-    3: "过载故障",
-}
+HEALTH_MAPPING: Dict[int, str] = load_health_mapping()
 HEALTH_NUM = len(HEALTH_MAPPING)
 
 

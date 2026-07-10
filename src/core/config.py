@@ -180,6 +180,344 @@ def _resolve_kg_config(path: str = DEFAULT_CONFIG_PATH) -> Dict[str, Any]:
     return merged
 
 
+# -------------------- 训练脚本配置 --------------------
+
+_TRAINING_FIELDS_INT: tuple = ("seed",)
+_TRAINING_FIELDS_STR: tuple = ("mode", "device")
+_TRAINING_REQUIRED: frozenset = frozenset(_TRAINING_FIELDS_INT + _TRAINING_FIELDS_STR)
+
+_DIAGNOSIS_FIELDS_INT: tuple = ("epochs", "hidden_dim", "num_layers")
+_DIAGNOSIS_FIELDS_FLOAT: tuple = ("dropout", "lr", "weight_decay")
+_DIAGNOSIS_FIELDS_OPT_STR: tuple = ("save_model_path",)
+_DIAGNOSIS_REQUIRED: frozenset = frozenset(
+    _DIAGNOSIS_FIELDS_INT + _DIAGNOSIS_FIELDS_FLOAT
+)
+
+_PREDICTION_FIELDS_INT: tuple = (
+    "transformer_id", "hold_out", "epochs", "hidden_dim",
+)
+_PREDICTION_FIELDS_FLOAT: tuple = ("test_ratio", "lr")
+_PREDICTION_FIELDS_STR: tuple = ("csv_path",)
+_PREDICTION_FIELDS_OPT_STR: tuple = ("save_model_path",)
+_PREDICTION_REQUIRED: frozenset = frozenset(
+    _PREDICTION_FIELDS_INT + _PREDICTION_FIELDS_FLOAT + _PREDICTION_FIELDS_STR
+)
+
+
+def _validate_section_opt(
+    data: Dict[str, Any],
+    section: str,
+    required: frozenset,
+    int_fields: tuple,
+    float_fields: tuple,
+    str_fields: tuple,
+    opt_str_fields: tuple,
+    path: str,
+) -> Dict[str, Any]:
+    """带可选字段的字段存在性检查 + 类型校正。"""
+    missing = [k for k in required if k not in data or data[k] is None]
+    if missing:
+        raise RuntimeError(
+            f"配置文件 {path} 的 `{section}:` 段缺少字段: {missing}。"
+            f"必需字段: {sorted(required)}"
+        )
+    merged: Dict[str, Any] = {k: data[k] for k in required}
+    for key in int_fields:
+        merged[key] = int(merged[key])
+    for key in float_fields:
+        merged[key] = float(merged[key])
+    for key in str_fields:
+        merged[key] = str(merged[key])
+    for key in opt_str_fields:
+        v = data.get(key, None)
+        merged[key] = str(v) if v is not None else None
+    return merged
+
+
+def _resolve_training_config(path: str = DEFAULT_CONFIG_PATH) -> Dict[str, Any]:
+    root = _load_yaml_config(path)
+    section_data = _require_section(root, "training", path)
+    merged = _validate_and_coerce(
+        section_data,
+        section="training",
+        required=_TRAINING_REQUIRED,
+        int_fields=_TRAINING_FIELDS_INT,
+        bool_fields=(),
+        str_fields=_TRAINING_FIELDS_STR,
+        path=path,
+    )
+    logger.info("已加载 training 配置 | mode=%s | seed=%s | device=%s",
+                merged["mode"], merged["seed"], merged["device"])
+    return merged
+
+
+def _resolve_diagnosis_config(path: str = DEFAULT_CONFIG_PATH) -> Dict[str, Any]:
+    root = _load_yaml_config(path)
+    section_data = _require_section(root, "diagnosis", path)
+    merged = _validate_section_opt(
+        section_data,
+        section="diagnosis",
+        required=_DIAGNOSIS_REQUIRED,
+        int_fields=_DIAGNOSIS_FIELDS_INT,
+        float_fields=_DIAGNOSIS_FIELDS_FLOAT,
+        str_fields=(),
+        opt_str_fields=_DIAGNOSIS_FIELDS_OPT_STR,
+        path=path,
+    )
+    logger.info("已加载 diagnosis 配置 | epochs=%s | hidden_dim=%s | lr=%s",
+                merged["epochs"], merged["hidden_dim"], merged["lr"])
+    return merged
+
+
+def _resolve_prediction_config(path: str = DEFAULT_CONFIG_PATH) -> Dict[str, Any]:
+    root = _load_yaml_config(path)
+    section_data = _require_section(root, "prediction", path)
+    merged = _validate_section_opt(
+        section_data,
+        section="prediction",
+        required=_PREDICTION_REQUIRED,
+        int_fields=_PREDICTION_FIELDS_INT,
+        float_fields=_PREDICTION_FIELDS_FLOAT,
+        str_fields=_PREDICTION_FIELDS_STR,
+        opt_str_fields=_PREDICTION_FIELDS_OPT_STR,
+        path=path,
+    )
+    logger.info("已加载 prediction 配置 | csv_path=%s | epochs=%s | lr=%s",
+                merged["csv_path"], merged["epochs"], merged["lr"])
+    return merged
+
+
+@dataclass(frozen=True)
+class TrainingConfig:
+    """训练脚本顶层配置（从 ``config/config.yaml`` 加载）。"""
+    mode: str
+    seed: int
+    device: str
+
+    @classmethod
+    def default(cls) -> "TrainingConfig":
+        return cls.from_yaml(DEFAULT_CONFIG_PATH)
+
+    @classmethod
+    def from_yaml(cls, path: str) -> "TrainingConfig":
+        merged = _resolve_training_config(path)
+        return cls(mode=merged["mode"], seed=int(merged["seed"]),
+                   device=merged["device"])
+
+
+@dataclass(frozen=True)
+class DiagnosisTrainingConfig:
+    """故障诊断训练配置（从 ``config/config.yaml`` 加载）。"""
+    epochs: int
+    hidden_dim: int
+    num_layers: int
+    dropout: float
+    lr: float
+    weight_decay: float
+    save_model_path: Optional[str]
+
+    @classmethod
+    def default(cls) -> "DiagnosisTrainingConfig":
+        return cls.from_yaml(DEFAULT_CONFIG_PATH)
+
+    @classmethod
+    def from_yaml(cls, path: str) -> "DiagnosisTrainingConfig":
+        m = _resolve_diagnosis_config(path)
+        return cls(
+            epochs=int(m["epochs"]),
+            hidden_dim=int(m["hidden_dim"]),
+            num_layers=int(m["num_layers"]),
+            dropout=float(m["dropout"]),
+            lr=float(m["lr"]),
+            weight_decay=float(m["weight_decay"]),
+            save_model_path=m.get("save_model_path"),
+        )
+
+
+@dataclass(frozen=True)
+class PredictionTrainingConfig:
+    """故障预测训练配置（从 ``config/config.yaml`` 加载）。"""
+    csv_path: str
+    transformer_id: int
+    hold_out: int
+    test_ratio: float
+    epochs: int
+    lr: float
+    hidden_dim: int
+    save_model_path: Optional[str]
+
+    @classmethod
+    def default(cls) -> "PredictionTrainingConfig":
+        return cls.from_yaml(DEFAULT_CONFIG_PATH)
+
+    @classmethod
+    def from_yaml(cls, path: str) -> "PredictionTrainingConfig":
+        m = _resolve_prediction_config(path)
+        return cls(
+            csv_path=m["csv_path"],
+            transformer_id=int(m["transformer_id"]),
+            hold_out=int(m["hold_out"]),
+            test_ratio=float(m["test_ratio"]),
+            epochs=int(m["epochs"]),
+            lr=float(m["lr"]),
+            hidden_dim=int(m["hidden_dim"]),
+            save_model_path=m.get("save_model_path"),
+        )
+
+
+def load_training_configs(
+    path: str = DEFAULT_CONFIG_PATH,
+) -> tuple[TrainingConfig, DiagnosisTrainingConfig, PredictionTrainingConfig]:
+    """一次性加载全部训练配置。"""
+    return (
+        TrainingConfig.from_yaml(path),
+        DiagnosisTrainingConfig.from_yaml(path),
+        PredictionTrainingConfig.from_yaml(path),
+    )
+
+
+def _resolve_health_mapping_config(
+    path: str = DEFAULT_CONFIG_PATH,
+) -> Dict[int, str]:
+    """从 YAML 的 `health_mapping` 段读取健康状态标签映射。
+
+    YAML 格式为有序列表，列表下标即为标签 ID。例如::
+
+        health_mapping:
+          - "正常运行"
+          - "轻微过热"
+          - "严重过热"
+          - "过载故障"
+
+    空字符串/全空白/None 条目会被跳过并记录警告。
+    """
+    root = _load_yaml_config(path)
+    raw = root.get("health_mapping", None)
+    if raw is None:
+        raise RuntimeError(
+            f"配置文件 {path} 缺少 `health_mapping:` 段，"
+            f"请在 YAML 中添加列表形式的健康状态描述。"
+        )
+    if not isinstance(raw, list):
+        raise RuntimeError(
+            f"配置文件 {path} 的 `health_mapping:` 段必须是列表形式 "
+            f"(当前类型: {type(raw).__name__})"
+        )
+
+    mapping: Dict[int, str] = {}
+    for idx, val in enumerate(raw):
+        if val is None:
+            logger.warning("health_mapping 第 %d 项为 None，跳过该条目", idx)
+            continue
+        if not isinstance(val, str) or not val.strip():
+            logger.warning(
+                "health_mapping 第 %d 项 (%r) 不是有效字符串，跳过",
+                idx, val,
+            )
+            continue
+        mapping[idx] = val.strip()
+
+    if not mapping:
+        raise RuntimeError(
+            f"config 文件 {path} 的 `health_mapping:` 列表为空或全部条目无效"
+        )
+    logger.info(
+        "已加载 health_mapping | 共 %d 个标签: %s",
+        len(mapping), mapping,
+    )
+    return mapping
+
+
+@dataclass(frozen=True)
+class HealthMappingConfig:
+    """健康状态标签映射配置（从 ``config/config.yaml`` 加载）。
+
+    字段:
+        mapping: Dict[int, str] —— 标签 ID -> 中文描述
+        health_num: int —— 标签总数（自动计算）
+    """
+    mapping: Dict[int, str]
+    health_num: int
+
+    @classmethod
+    def default(cls) -> "HealthMappingConfig":
+        return cls.from_yaml(DEFAULT_CONFIG_PATH)
+
+    @classmethod
+    def from_yaml(cls, path: str) -> "HealthMappingConfig":
+        m = _resolve_health_mapping_config(path)
+        return cls(mapping=m, health_num=len(m))
+
+
+def load_health_mapping(
+    path: str = DEFAULT_CONFIG_PATH,
+) -> Dict[int, str]:
+    """便捷函数：直接返回 {标签 id: 中文描述} 的映射。"""
+    return HealthMappingConfig.from_yaml(path).mapping
+
+
+def _resolve_inference_config(
+    path: str = DEFAULT_CONFIG_PATH,
+) -> Dict[str, Any]:
+    """从 YAML 的 `inference:` 段读取推理引擎参数（predict.py）。"""
+    root = _load_yaml_config(path)
+    section_data = _require_section(root, "inference", path)
+
+    models_dir = section_data.get("models_dir", "./models")
+    instance = section_data.get("instance", "")
+    top_k = int(section_data.get("top_k", 3))
+    device = section_data.get("device", "cpu")
+
+    if not isinstance(models_dir, str) or not models_dir.strip():
+        models_dir = "./models"
+    if not isinstance(instance, str):
+        instance = str(instance) if instance is not None else ""
+    if not isinstance(device, str) or not device.strip():
+        device = "cpu"
+
+    merged: Dict[str, Any] = {
+        "models_dir": models_dir.strip(),
+        "instance": instance,
+        "top_k": top_k,
+        "device": device.strip(),
+    }
+    logger.info(
+        "已加载 inference 配置 | models_dir=%s | top_k=%d | device=%s",
+        merged["models_dir"], merged["top_k"], merged["device"],
+    )
+    return merged
+
+
+@dataclass(frozen=True)
+class InferenceConfig:
+    """推理引擎配置（predict.py 的默认参数，从 ``config/config.yaml`` 加载）。"""
+    models_dir: str
+    instance: str
+    top_k: int
+    device: str
+
+    @classmethod
+    def default(cls) -> "InferenceConfig":
+        return cls.from_yaml(DEFAULT_CONFIG_PATH)
+
+    @classmethod
+    def from_yaml(cls, path: str) -> "InferenceConfig":
+        m = _resolve_inference_config(path)
+        return cls(
+            models_dir=str(m["models_dir"]),
+            instance=str(m["instance"]),
+            top_k=int(m["top_k"]),
+            device=str(m["device"]),
+        )
+
+
+def load_inference_config(
+    path: str = DEFAULT_CONFIG_PATH,
+) -> InferenceConfig:
+    """便捷函数：加载 InferenceConfig。"""
+    return InferenceConfig.from_yaml(path)
+
+
 # -------------------- ES 连接配置 --------------------
 @dataclass(frozen=True)
 class ESConfig:

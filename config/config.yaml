@@ -6,11 +6,11 @@
 
 # -------------------- Elasticsearch 连接 --------------------
 elasticsearch:
-  host: "10.1.13.30"
+  host: 10.1.13.30
   port: 30920
-  username: "elastic"
-  password: "E1OfAx4Nf55513tU4i40eQbA"
-  scheme: "http"
+  username: elastic
+  password: E1OfAx4Nf55513tU4i40eQbA
+  scheme: http
   timeout: 60
   max_retries: 3
   retry_on_timeout: true
@@ -20,26 +20,91 @@ elasticsearch:
 # 当你的 ES 集群使用不同的命名约定时，只需在此处调整。
 knowledge_graph:
   # 图谱标识
-  graph_id: "992504969637961728"
-  ontology_id: "992355151124930560"
+  graph_id: 992504969637961728
+  ontology_id: 992355151124930560
 
   # 批处理大小
   batch_size: 5000
 
   # 三个索引名
-  entity_index: "knowledge_entity_index"
-  relation_index: "knowledge_entity_relation_index"
-  relation_type_index: "knowledge_entity_type_relation_index"
+  entity_index: knowledge_entity_index
+  relation_index: knowledge_entity_relation_index
+  relation_type_index: knowledge_entity_type_relation_index
 
   # 实体索引字段
-  entity_id_field: "entityId"
-  entity_name_field: "name"
+  entity_id_field: entityId
+  entity_name_field: name
 
   # 关系索引字段
-  head_id_field: "srcEntityId"
-  tail_id_field: "dstEntityId"
-  relation_field: "relationTypeId"
+  head_id_field: srcEntityId
+  tail_id_field: dstEntityId
+  relation_field: relationTypeId
 
   # 关系类型索引字段
-  relation_type_id_field: "relationTypeId"
-  relation_type_name_field: "name"
+  relation_type_id_field: relationTypeId
+  relation_type_name_field: name
+
+# -------------------- 训练脚本全局参数 --------------------
+training:
+  # 训练模式: both / diagnosis / prediction
+  mode: both
+  # 随机种子
+  seed: 42
+  # 训练设备: auto / cpu / cuda:0
+  device: auto
+
+# -------------------- 故障诊断训练参数（R-GCN + 三元组知识图谱） --------------------
+diagnosis:
+  # 训练轮数
+  epochs: 300
+  # R-GCN 隐藏层维度
+  hidden_dim: 64
+  # R-GCN 层数
+  num_layers: 2
+  # Dropout 比例
+  dropout: 0.3
+  # 学习率
+  lr: 5e-4
+  # L2 正则化
+  weight_decay: 5e-4
+  # 模型保存路径（留空/null 表示不保存）
+  save_model_path: /mnt/work/code/python_workspace/kg-geometric/trained_models
+
+# -------------------- 故障预测训练参数（时序异构图 + CSV） --------------------
+prediction:
+  # 变压器时序 CSV 数据文件路径
+  csv_path: /home/binchen/Workspaces/PIE-Knowledge/故障诊断+故障预测/电力变压器数据集-ETDataset/ETDataset/ETT-small/ETTh2.csv
+  # transformer 节点 ID
+  transformer_id: 0
+  # 从数据集尾部预留的未知样本数
+  hold_out: 10
+  # 测试集比例
+  test_ratio: 0.2
+  # 训练轮数
+  epochs: 100
+  # 学习率
+  lr: 1e-3
+  # 隐藏层维度
+  hidden_dim: 32
+  # 模型保存路径（留空/null 表示不保存）
+  save_model_path: /mnt/work/code/python_workspace/kg-geometric/trained_models
+
+# -------------------- 健康状态映射（变压器时序异构图） --------------------
+# 列表形式，下标即为标签 ID。新增/删除条目会同步改变 HEALTH_NUM，
+# 训练时最后一层分类头大小也会随之变化。
+health_mapping:
+  - 正常运行
+  - 轻微过热
+  - 严重过热
+  - 过载故障
+
+# -------------------- 推理引擎参数（predict.py） --------------------
+inference:
+  # 模型文件路径
+  model_path: /mnt/work/code/python_workspace/kg-geometric/trained_models/kg_fault_model.pth
+  # 输入实例文本（多个症状以换行符 \n 分隔）
+  instance: "振动过高\n温度过高"
+  # 返回 Top-K 故障诊断结果
+  top_k: 3
+  # 推理设备: cpu / cuda / cuda:0 等
+  device: cpu

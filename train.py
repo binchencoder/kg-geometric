@@ -42,7 +42,13 @@ from sklearn.model_selection import train_test_split
 from torch_geometric.data import HeteroData
 from torch_geometric.nn import RGCNConv, Linear
 
-from src.core.config import ESConfig, logger
+from src.core.config import (
+    DiagnosisTrainingConfig,
+    ESConfig,
+    PredictionTrainingConfig,
+    TrainingConfig,
+    logger,
+)
 from src.dataset.temporal_dataset import KGTemporalDataset
 from src.dataset.triple_dataset import KGTripleDataset
 from src.model import TGNOilTemperaturePredict
@@ -168,7 +174,7 @@ def run_fault_diagnosis_training(
 
     # ---- 保存 ----
     if save_model_path:
-        os.makedirs(os.path.dirname(save_model_path) or ".", exist_ok=True)
+        os.makedirs(save_model_path, exist_ok=True)
         torch.save({
             "model_state_dict": model.state_dict(),
             "num_nodes": model.num_nodes,
@@ -176,7 +182,7 @@ def run_fault_diagnosis_training(
             "hidden_dim": hidden_dim,
             "num_layers": num_layers,
             "dropout": dropout,
-        }, save_model_path)
+        }, os.path.join(save_model_path, "diagnosis_model.pth"))
         logger.info("故障诊断 | 模型已保存至: %s", save_model_path)
 
     return model
@@ -487,66 +493,71 @@ def print_temporal_inference(
 # 命令行参数
 # =============================================================================
 
-def _parse_args() -> argparse.Namespace:
+def _parse_args(
+    train_cfg: TrainingConfig,
+    diag_cfg: DiagnosisTrainingConfig,
+    pred_cfg: PredictionTrainingConfig,
+) -> argparse.Namespace:
+    """从命令行解析参数；默认值全部来自 ``config/config.yaml``。"""
     parser = argparse.ArgumentParser(
         description="知识图谱统一训练：故障诊断 (R-GCN) + 故障预测 (R-GCN+TGN)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 示例:
-  # 默认同时运行两个流程
-  python train.py --mode both --csv-path /path/to/ETTh1.csv
+  # 默认同时运行两个流程（所有参数来自 config/config.yaml）
+  python train.py
 
-  # 仅故障诊断
-  python train.py --mode diagnosis --epochs 500 --hidden-dim 128
+  # 仅故障诊断（命令行可覆盖 YAML 默认值）
+  python train.py --mode diagnosis --diag-epochs 500 --diag-hidden-dim 128
   python train.py --mode diagnosis --query "加速迟缓" --device cuda
 
   # 仅故障预测（变压器时序数据）
   python train.py --mode prediction --csv-path /path/to/ETTh1.csv
-  python train.py --mode prediction --hold-out 10 --epochs 200 --lr 1e-3
+  python train.py --mode prediction --pred-hold-out 10 --pred-epochs 200 --pred-lr 1e-3
 """,
     )
 
     # ---- 流程选择 ----
-    parser.add_argument("--mode", type=str, default="both",
+    parser.add_argument("--mode", type=str, default=train_cfg.mode,
                         choices=["both", "diagnosis", "prediction"],
-                        help="训练模式 (默认: both)")
-    parser.add_argument("--seed", type=int, default=42,
-                        help="随机种子 (默认: 42)")
-    parser.add_argument("--device", type=str, default="auto",
-                        help="训练设备，auto= CUDA 优先 (默认: auto)")
+                        help=f"训练模式 (默认来自 config.yaml: {train_cfg.mode})")
+    parser.add_argument("--seed", type=int, default=train_cfg.seed,
+                        help=f"随机种子 (默认来自 config.yaml: {train_cfg.seed})")
+    parser.add_argument("--device", type=str, default=train_cfg.device,
+                        help=f"训练设备，auto= CUDA 优先 (默认来自 config.yaml: {train_cfg.device})")
 
     # ---- 故障诊断参数（ES 三元组知识图谱） ----
-    parser.add_argument("--diag-epochs", type=int, default=300,
-                        help="[诊断] 训练轮数 (默认: 300)")
-    parser.add_argument("--diag-hidden-dim", type=int, default=64,
-                        help="[诊断] R-GCN 隐藏层维度 (默认: 64)")
-    parser.add_argument("--diag-num-layers", type=int, default=2,
-                        help="[诊断] R-GCN 层数 (默认: 2)")
-    parser.add_argument("--diag-dropout", type=float, default=0.3,
-                        help="[诊断] Dropout 比例 (默认: 0.3)")
-    parser.add_argument("--diag-lr", type=float, default=5e-4,
-                        help="[诊断] 学习率 (默认: 5e-4)")
-    parser.add_argument("--diag-weight-decay", type=float, default=5e-4,
-                        help="[诊断] L2 正则化 (默认: 5e-4)")
-    parser.add_argument("--diag-save", type=str, default=None,
+    parser.add_argument("--diag-epochs", type=int, default=diag_cfg.epochs,
+                        help=f"[诊断] 训练轮数 (默认来自 config.yaml: {diag_cfg.epochs})")
+    parser.add_argument("--diag-hidden-dim", type=int, default=diag_cfg.hidden_dim,
+                        help=f"[诊断] R-GCN 隐藏层维度 (默认来自 config.yaml: {diag_cfg.hidden_dim})")
+    parser.add_argument("--diag-num-layers", type=int, default=diag_cfg.num_layers,
+                        help=f"[诊断] R-GCN 层数 (默认来自 config.yaml: {diag_cfg.num_layers})")
+    parser.add_argument("--diag-dropout", type=float, default=diag_cfg.dropout,
+                        help=f"[诊断] Dropout 比例 (默认来自 config.yaml: {diag_cfg.dropout})")
+    parser.add_argument("--diag-lr", type=float, default=diag_cfg.lr,
+                        help=f"[诊断] 学习率 (默认来自 config.yaml: {diag_cfg.lr})")
+    parser.add_argument("--diag-weight-decay", type=float, default=diag_cfg.weight_decay,
+                        help=f"[诊断] L2 正则化 (默认来自 config.yaml: {diag_cfg.weight_decay})")
+    parser.add_argument("--diag-save", type=str, default=diag_cfg.save_model_path,
                         help="[诊断] 模型保存路径 (如 ./models/rgcn_fault_diag.pt)")
 
     # ---- 故障预测参数（时序异构图 + CSV） ----
-    parser.add_argument("--csv-path", type=str, default="/home/binchen/Workspaces/PIE-Knowledge/故障诊断+故障预测/电力变压器数据集-ETDataset/ETDataset/ETT-small/ETTh2.csv",
-                        help="[预测] 变压器时序 CSV 数据文件路径")
-    parser.add_argument("--pred-transformer-id", type=int, default=0,
-                        help="[预测] transformer 节点 ID (默认: 0)")
-    parser.add_argument("--pred-hold-out", type=int, default=10,
-                        help="[预测] 从数据集尾部预留的未知样本数 (默认: 10)")
-    parser.add_argument("--pred-test-ratio", type=float, default=0.2,
-                        help="[预测] 测试集比例 (默认: 0.2)")
-    parser.add_argument("--pred-epochs", type=int, default=100,
-                        help="[预测] 训练轮数 (默认: 100)")
-    parser.add_argument("--pred-lr", type=float, default=1e-3,
-                        help="[预测] 学习率 (默认: 1e-3)")
-    parser.add_argument("--pred-hidden-dim", type=int, default=32,
-                        help="[预测] 隐藏层维度 (默认: 32)")
-    parser.add_argument("--pred-save-dir", type=str, default=None,
+    parser.add_argument("--csv-path", type=str, default=pred_cfg.csv_path,
+                        help="[预测] 变压器时序 CSV 数据文件路径 (默认来自 config.yaml)")
+    parser.add_argument("--pred-transformer-id", type=int, default=pred_cfg.transformer_id,
+                        help=f"[预测] transformer 节点 ID (默认来自 config.yaml: {pred_cfg.transformer_id})")
+    parser.add_argument("--pred-hold-out", type=int, default=pred_cfg.hold_out,
+                        help=f"[预测] 从数据集尾部预留的未知样本数 (默认来自 config.yaml: {pred_cfg.hold_out})")
+    parser.add_argument("--pred-test-ratio", type=float, default=pred_cfg.test_ratio,
+                        help=f"[预测] 测试集比例 (默认来自 config.yaml: {pred_cfg.test_ratio})")
+    parser.add_argument("--pred-epochs", type=int, default=pred_cfg.epochs,
+                        help=f"[预测] 训练轮数 (默认来自 config.yaml: {pred_cfg.epochs})")
+    parser.add_argument("--pred-lr", type=float, default=pred_cfg.lr,
+                        help=f"[预测] 学习率 (默认来自 config.yaml: {pred_cfg.lr})")
+    parser.add_argument("--pred-hidden-dim", type=int, default=pred_cfg.hidden_dim,
+                        help=f"[预测] 隐藏层维度 (默认来自 config.yaml: {pred_cfg.hidden_dim})")
+    parser.add_argument("--pred-save-dir", type=str, default=pred_cfg.save_model_path,
                         help="[预测] 模型保存目录 (如 ./models/temporal)")
 
     # ---- 推理参数 ----
@@ -571,7 +582,15 @@ def _parse_args() -> argparse.Namespace:
 # =============================================================================
 
 def main() -> None:
-    args = _parse_args()
+    train_cfg = TrainingConfig.default()
+    diag_cfg = DiagnosisTrainingConfig.default()
+    pred_cfg = PredictionTrainingConfig.default()
+    logger.info(
+        "TrainingConfig 已从 config/config.yaml 加载 | mode=%s | seed=%d | device=%s",
+        train_cfg.mode, train_cfg.seed, train_cfg.device,
+    )
+
+    args = _parse_args(train_cfg, diag_cfg, pred_cfg)
     set_seed(args.seed)
     device = _resolve_device(args.device)
     logger.info("统一训练脚本启动 | mode=%s | device=%s | seed=%d",
@@ -585,7 +604,7 @@ def main() -> None:
     # ========================================================================
     if args.mode in ("both", "diagnosis"):
         print("\n" + "=" * 64)
-        print("🔎 [1/2] 故障诊断：知识图谱 R-GCN 训练")
+        print("🔎 [1/2] 故障诊断模型：知识图谱 R-GCN 训练")
         print("=" * 64)
 
         print("\n📦 加载 “故障诊断” 知识图谱...")
@@ -640,7 +659,7 @@ def main() -> None:
             raise FileNotFoundError(f"CSV 文件不存在: {args.csv_path}")
 
         print("\n" + "=" * 64)
-        print("🌡️  [2/2] 故障预测：时序异构图 R-GCN + TGN 联合训练")
+        print("🌡️  [2/2] 故障预测模型：时序异构图 R-GCN + TGN 联合训练")
         print("=" * 64)
 
         print(f"\n📦 加载 CSV: {args.csv_path}")

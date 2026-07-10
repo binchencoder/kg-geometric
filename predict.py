@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 
-from src.core.config import ESConfig
+from src.core.config import ESConfig, InferenceConfig
 from demo.fault_diagnosis import FaultGCN, KGTripleDataset, topk_fault_diagnosis
 
 # ============================================================
@@ -618,7 +618,7 @@ def predict_all(models_dir: str, instance: str) -> Dict[str, str]:
 # ============================================================
 
 
-def _build_arg_parser() -> "argparse.ArgumentParser":
+def _build_arg_parser(cfg: InferenceConfig) -> "argparse.ArgumentParser":
     import argparse
 
     parser = argparse.ArgumentParser(
@@ -634,31 +634,32 @@ def _build_arg_parser() -> "argparse.ArgumentParser":
     )
     parser.add_argument(
         "--models-dir",
-        default="./models",
-        help="模型目录路径 (默认: ./models)",
+        default=cfg.models_dir,
+        help=f"模型目录路径 (默认来自 config.yaml: {cfg.models_dir})",
     )
     parser.add_argument(
         "--instance",
-        default="振动过高\n温度过高",
-        help="输入实例文本，多个症状以换行符分隔",
+        default=cfg.instance,
+        help="输入实例文本，多个症状以换行符分隔 (默认来自 config.yaml)",
     )
     parser.add_argument(
         "--top-k",
         type=int,
-        default=3,
-        help="返回 Top-K 故障诊断结果 (默认: 3)",
+        default=cfg.top_k,
+        help=f"返回 Top-K 故障诊断结果 (默认来自 config.yaml: {cfg.top_k})",
     )
     parser.add_argument(
         "--device",
-        default="cpu",
-        help="推理设备 (默认: cpu, 可选: cuda / cuda:0 等)",
+        default=cfg.device,
+        help=f"推理设备 (默认来自 config.yaml: {cfg.device})",
     )
     return parser
 
 
 def main() -> None:
     """主入口。"""
-    parser = _build_arg_parser()
+    cfg = InferenceConfig.default()
+    parser = _build_arg_parser(cfg)
     args = parser.parse_args()
 
     # ---- 注册模型处理器 ----
