@@ -15,7 +15,12 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
-from src.core.config import logger, ESConfig, KnowledgeGraphSchema
+from src.core.config import (
+    logger,
+    ESConfig,
+    KnowledgeGraphSchema,
+    RelationMappingConfig,
+)
 from src.core.types import Triple
 
 
@@ -75,6 +80,7 @@ class KGTripleDataset:
             es_relation_type_id_field: Optional[str] = None,
             es_relation_type_name_field: Optional[str] = None,
             use_builtin_example: bool = False,
+            default_relation_mapping: Optional[Dict[str, str]] = None,
     ) -> None:
         # 从 config/config.yaml 加载默认值，显式传入将覆盖 YAML 配置
         schema = KnowledgeGraphSchema.default().override(
@@ -92,6 +98,11 @@ class KGTripleDataset:
             relation_type_id_field=es_relation_type_id_field,
             relation_type_name_field=es_relation_type_name_field,
         )
+
+        # 语义角色→关系名映射：优先使用显式传入，否则从 config.yaml 读取
+        if default_relation_mapping is None:
+            default_relation_mapping = RelationMappingConfig.default().mapping
+        self._default_relation_mapping: Dict[str, str] = dict(default_relation_mapping)
 
         if not use_builtin_example:
             self.triples = self._load_from_es(
@@ -144,6 +155,28 @@ class KGTripleDataset:
         self.y = torch.tensor(
             [self.labels[node] for node in ordered_nodes], dtype=torch.long
         )
+
+    @property
+    def default_relation_mapping(self) -> Dict[str, str]:
+        """语义角色 → 关系名映射。
+
+        优先使用构造/反序列化时保存的 ``_default_relation_mapping``；
+        兼容旧版 checkpoint：若对象被反序列化且缺少该属性（在
+        relation_mapping 配置引入之前保存的模型），自动回退到当前
+        ``config.yaml`` 的 ``relation_mapping`` 配置，避免 AttributeError。
+        """
+        mapping = getattr(self, "_default_relation_mapping", None)
+        if mapping is None:
+            logger.warning(
+                "数据集缺少 default_relation_mapping 属性（旧版 checkpoint），"
+                "回退到 config.yaml 的 relation_mapping 配置"
+            )
+            mapping = RelationMappingConfig.default().mapping
+        return mapping
+
+    @default_relation_mapping.setter
+    def default_relation_mapping(self, value: Dict[str, str]) -> None:
+        self._default_relation_mapping = dict(value)
 
     # ================================================================
     # 数据加载
@@ -331,14 +364,17 @@ class KGTripleDataset:
         """
         return list(self._backward.get(relation, {}).get(tail, []))
 
-    def get_symptom_nodes(self, relation: str) -> List[str]:
+    def get_symptom_nodes(self, relation: Optional[str] = None) -> List[str]:
         """获取所有症状描述节点（指定关系的 tail）。
 
         Parameters
         ----------
-        relation : str
-            用于识别症状节点的关系名称（默认: "表现为"）。
+        relation : Optional[str]
+            用于识别症状节点的关系名称（默认取自
+            config.yaml 的 relation_mapping.symptoms，回退为 "表现为"）。
         """
+        if relation is None:
+            relation = self.default_relation_mapping.get("symptoms")
         symptoms = set()
         for triple in self.triples:
             if triple.relation == relation:
@@ -349,11 +385,13 @@ class KGTripleDataset:
         """获取所有故障类别节点（三元组 head 中唯一的故障根节点名称）。
 
         这些是知识图谱中的核心故障概念（如"发动机动力不足"），
-        它们通过"表现为"连接症状、通过"由...引起"连接具体原因。
+        它们通过症状关系（config.yaml 的 relation_mapping.symptoms）连接症状、
+        通过"由...引起"连接具体原因。
         """
+        symptom_relation = self.default_relation_mapping.get("symptoms")
         fault_categories = set()
         for triple in self.triples:
-            if triple.relation == "表现为":
+            if triple.relation == symptom_relation:
                 fault_categories.add(triple.head)
         return sorted(fault_categories)
 
@@ -371,8 +409,8 @@ class KGTripleDataset:
         relation_mapping : Optional[Dict[str, str]]
             语义角色 → 实际关系名的映射。例如
             {"causes": "由...引起", "actions": "维修措施"}。
-            不传则使用默认映射；若默认映射在当前图谱中不存在，
-            则按真实关系名分组返回。
+            不传则使用 ``self.default_relation_mapping``（来自 config.yaml）；
+            若映射在当前图谱中不存在，则按真实关系名分组返回。
 
         Returns
         -------
@@ -383,15 +421,8 @@ class KGTripleDataset:
             若映射全部失效（ type-agnostic 模式）：
                 {relation_name: [tails], ...}
         """
-        default_mapping = {
-            "symptoms": "表现为",
-            "causes": "由...引起",
-            "actions": "维修措施",
-            "tools": "需要工具",
-            "system": "属于系统",
-            "category": "属于类别",
-        }
-        mapping = relation_mapping if relation_mapping is not None else default_mapping
+        mapping = relation_mapping if relation_mapping is not None \
+            else self.default_relation_mapping
 
         result: Dict[str, List[str]] = {}
         for key, relation in mapping.items():

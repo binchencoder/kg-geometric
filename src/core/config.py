@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 # -------------------- 日志配置 --------------------
@@ -459,42 +460,105 @@ def load_health_mapping(
 def _resolve_inference_config(
     path: str = DEFAULT_CONFIG_PATH,
 ) -> Dict[str, Any]:
-    """从 YAML 的 `inference:` 段读取推理引擎参数（predict.py）。"""
+    """从 YAML 的 `inference:` 段读取推理引擎参数（predict.py）。
+
+    当前结构（支持两路子配置：link_prediction 与 trend_prediction）::
+
+        inference:
+          device: cpu
+          link_prediction:
+            model_path: /path/to/kg_fault_model.pth
+            instance: "振动过高\\n温度过高"
+            top_k: 3
+          trend_prediction:
+            model_path: /path/to/kg_trend_model.pth
+    """
     root = _load_yaml_config(path)
     section_data = _require_section(root, "inference", path)
 
-    models_dir = section_data.get("models_dir", "./models")
-    instance = section_data.get("instance", "")
-    top_k = int(section_data.get("top_k", 3))
     device = section_data.get("device", "cpu")
-
-    if not isinstance(models_dir, str) or not models_dir.strip():
-        models_dir = "./models"
-    if not isinstance(instance, str):
-        instance = str(instance) if instance is not None else ""
     if not isinstance(device, str) or not device.strip():
         device = "cpu"
 
+    lp = section_data.get("link_prediction") or {}
+    if not isinstance(lp, dict):
+        lp = {}
+
+    model_path = lp.get("model_path", "")
+    instance = lp.get("instance", "")
+    top_k = int(lp.get("top_k", 3))
+
+    if not isinstance(model_path, str):
+        model_path = str(model_path) if model_path is not None else ""
+    if not isinstance(instance, str):
+        instance = str(instance) if instance is not None else ""
+
+    # 兼容字段：models_dir 由 link_prediction.model_path 的父目录推导
+    if model_path.strip():
+        models_dir = str(Path(model_path).parent)
+    else:
+        models_dir = "./models"
+    if not models_dir.strip():
+        models_dir = "./models"
+
+    tp = section_data.get("trend_prediction") or {}
+    if not isinstance(tp, dict):
+        tp = {}
+    trend_model_path = tp.get("model_path", "")
+    if not isinstance(trend_model_path, str):
+        trend_model_path = str(trend_model_path) if trend_model_path is not None else ""
+
     merged: Dict[str, Any] = {
-        "models_dir": models_dir.strip(),
-        "instance": instance,
-        "top_k": top_k,
         "device": device.strip(),
+        "models_dir": models_dir.strip(),
+        "link_prediction": {
+            "model_path": model_path.strip(),
+            "instance": instance,
+            "top_k": top_k,
+        },
+        "trend_prediction": {
+            "model_path": trend_model_path.strip(),
+        },
     }
     logger.info(
-        "已加载 inference 配置 | models_dir=%s | top_k=%d | device=%s",
-        merged["models_dir"], merged["top_k"], merged["device"],
+        "已加载 inference 配置 | device=%s | models_dir=%s | link.top_k=%d",
+        merged["device"], merged["models_dir"],
+        merged["link_prediction"]["top_k"],
     )
     return merged
 
 
 @dataclass(frozen=True)
-class InferenceConfig:
-    """推理引擎配置（predict.py 的默认参数，从 ``config/config.yaml`` 加载）。"""
-    models_dir: str
+class LinkPredictionConfig:
+    """链接预测（故障诊断）推理子配置。"""
+    model_path: str
     instance: str
     top_k: int
+
+
+@dataclass(frozen=True)
+class TrendPredictionConfig:
+    """趋势预测推理子配置。"""
+    model_path: str
+
+
+@dataclass(frozen=True)
+class InferenceConfig:
+    """推理引擎配置（predict.py 的默认参数，从 ``config/config.yaml`` 加载）。"""
     device: str
+    models_dir: str
+    link_prediction: LinkPredictionConfig
+    trend_prediction: TrendPredictionConfig
+
+    @property
+    def instance(self) -> str:
+        """兼容字段：返回 link_prediction.instance。"""
+        return self.link_prediction.instance
+
+    @property
+    def top_k(self) -> int:
+        """兼容字段：返回 link_prediction.top_k。"""
+        return self.link_prediction.top_k
 
     @classmethod
     def default(cls) -> "InferenceConfig":
@@ -504,10 +568,16 @@ class InferenceConfig:
     def from_yaml(cls, path: str) -> "InferenceConfig":
         m = _resolve_inference_config(path)
         return cls(
-            models_dir=str(m["models_dir"]),
-            instance=str(m["instance"]),
-            top_k=int(m["top_k"]),
             device=str(m["device"]),
+            models_dir=str(m["models_dir"]),
+            link_prediction=LinkPredictionConfig(
+                model_path=str(m["link_prediction"]["model_path"]),
+                instance=str(m["link_prediction"]["instance"]),
+                top_k=int(m["link_prediction"]["top_k"]),
+            ),
+            trend_prediction=TrendPredictionConfig(
+                model_path=str(m["trend_prediction"]["model_path"]),
+            ),
         )
 
 
@@ -696,6 +766,93 @@ class KnowledgeGraphSchema:
 def load_kg_config(path: str = DEFAULT_CONFIG_PATH) -> KnowledgeGraphSchema:
     """从 YAML 加载 KnowledgeGraphSchema；与 ``KnowledgeGraphSchema.from_yaml(path)`` 等价。"""
     return KnowledgeGraphSchema.from_yaml(path)
+
+
+# -------------------- 故障诊断关系映射 --------------------
+def _resolve_relation_mapping_config(
+    path: str = DEFAULT_CONFIG_PATH,
+) -> Dict[str, str]:
+    """从 YAML 的 `relation_mapping:` 段读取语义角色 → 关系名映射。
+
+    该映射用于 ``KGTripleDataset.get_fault_info`` 等场景，将
+    causes/actions/tools 等语义角色映射到图谱中实际的关系名称。
+
+    YAML 格式示例::
+
+        relation_mapping:
+          symptoms: "表现为"
+          causes: "由...引起"
+          actions: "维修措施"
+          tools: "需要工具"
+          system: "属于系统"
+          category: "属于类别"
+
+    段缺失时回退到与历史硬编码一致的内置默认映射（保证向后兼容）；
+    段存在但为空/全部无效时直接抛错。
+    """
+    root = _load_yaml_config(path)
+    raw = root.get("relation_mapping", None)
+    if raw is None:
+        logger.warning(
+            "配置文件 %s 缺少 `relation_mapping:` 段，使用内置默认关系映射",
+            path,
+        )
+        return {
+            "symptoms": "表现为",
+            "causes": "由...引起",
+            "actions": "维修措施",
+            "tools": "需要工具",
+            "system": "属于系统",
+            "category": "属于类别",
+        }
+    if not isinstance(raw, dict):
+        raise RuntimeError(
+            f"配置文件 {path} 的 `relation_mapping:` 段必须是 mapping "
+            f"(当前类型: {type(raw).__name__})"
+        )
+
+    mapping: Dict[str, str] = {}
+    for key, val in raw.items():
+        if val is None or not isinstance(val, str) or not val.strip():
+            logger.warning(
+                "relation_mapping 的 %r 项无效 (%r)，跳过", key, val,
+            )
+            continue
+        mapping[str(key)] = val.strip()
+
+    if not mapping:
+        raise RuntimeError(
+            f"config 文件 {path} 的 `relation_mapping:` 段为空或全部条目无效"
+        )
+    logger.info(
+        "已加载 relation_mapping | 共 %d 条: %s", len(mapping), mapping,
+    )
+    return mapping
+
+
+@dataclass(frozen=True)
+class RelationMappingConfig:
+    """故障诊断关系映射配置（从 ``config/config.yaml`` 加载）。
+
+    字段:
+        mapping: Dict[str, str] —— 语义角色 -> 图谱关系名
+    """
+    mapping: Dict[str, str]
+
+    @classmethod
+    def default(cls) -> "RelationMappingConfig":
+        return cls.from_yaml(DEFAULT_CONFIG_PATH)
+
+    @classmethod
+    def from_yaml(cls, path: str) -> "RelationMappingConfig":
+        return cls(mapping=_resolve_relation_mapping_config(path))
+
+
+def load_relation_mapping(
+    path: str = DEFAULT_CONFIG_PATH,
+) -> Dict[str, str]:
+    """便捷函数：直接返回 {语义角色: 关系名} 的映射。"""
+    return RelationMappingConfig.from_yaml(path).mapping
 
 
 # -------------------- 批量进度回调 --------------------

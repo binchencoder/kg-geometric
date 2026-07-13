@@ -182,8 +182,15 @@ def run_fault_diagnosis_training(
             "hidden_dim": hidden_dim,
             "num_layers": num_layers,
             "dropout": dropout,
+            # 图结构一并保存，推理时无需再连 ES
+            "graph_data": dataset.to_data_with_types(),
+            "node_to_idx": dataset.node_to_idx,
+            "fault_nodes": dataset.fault_nodes,
+            "idx_to_node": dataset.idx_to_node,
+            # 完整数据集对象（含图遍历映射），推理时用于提取原因/措施/工具
+            "dataset": dataset,
         }, os.path.join(save_model_path, "diagnosis_model.pth"))
-        logger.info("故障诊断 | 模型已保存至: %s", save_model_path)
+        logger.info("故障诊断 | 模型与图结构已保存至: %s", save_model_path)
 
     return model
 

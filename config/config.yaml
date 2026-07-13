@@ -44,6 +44,17 @@ knowledge_graph:
   relation_type_id_field: relationTypeId
   relation_type_name_field: name
 
+# -------------------- 故障诊断关系映射（语义角色 → 图谱关系名） --------------------
+# 将"原因/措施/工具"等语义角色映射到知识图谱中实际的关系名称。
+# 当图谱使用不同的关系命名时，只需在此处调整，无需改动代码。
+relation_mapping:
+  symptoms: "表现为"
+  causes: "由...引起"
+  actions: "维修措施"
+  tools: "需要工具"
+  system: "属于系统"
+  category: "属于类别"
+
 # -------------------- 训练脚本全局参数 --------------------
 training:
   # 训练模式: both / diagnosis / prediction
@@ -68,7 +79,7 @@ diagnosis:
   # L2 正则化
   weight_decay: 5e-4
   # 模型保存路径（留空/null 表示不保存）
-  save_model_path: /mnt/work/code/python_workspace/kg-geometric/trained_models
+  save_model_path: /mnt/work/code/python_workspace/kg-geometric/trained_models/diagnosis
 
 # -------------------- 故障预测训练参数（时序异构图 + CSV） --------------------
 prediction:
@@ -87,7 +98,7 @@ prediction:
   # 隐藏层维度
   hidden_dim: 32
   # 模型保存路径（留空/null 表示不保存）
-  save_model_path: /mnt/work/code/python_workspace/kg-geometric/trained_models
+  save_model_path: /mnt/work/code/python_workspace/kg-geometric/trained_models/trend
 
 # -------------------- 健康状态映射（变压器时序异构图） --------------------
 # 列表形式，下标即为标签 ID。新增/删除条目会同步改变 HEALTH_NUM，
@@ -100,11 +111,20 @@ health_mapping:
 
 # -------------------- 推理引擎参数（predict.py） --------------------
 inference:
-  # 模型文件路径
-  model_path: /mnt/work/code/python_workspace/kg-geometric/trained_models/kg_fault_model.pth
-  # 输入实例文本（多个症状以换行符 \n 分隔）
-  instance: "振动过高\n温度过高"
-  # 返回 Top-K 故障诊断结果
-  top_k: 3
   # 推理设备: cpu / cuda / cuda:0 等
   device: cpu
+
+  # 链接预测推理参数
+  link_prediction:
+    # 模型文件路径
+    model_path: /mnt/work/code/python_workspace/kg-geometric/trained_models/diagnosis/kg_fault_model.pth
+    # 输入实例文本（多个症状以换行符 \n 分隔）
+    instance: "发动机怠速不稳\n加速迟缓"
+    # 返回 Top-K 故障诊断结果
+    top_k: 3
+
+  # 趋势预测推理参数
+  trend_prediction:
+    # 模型文件路径
+    model_path: /mnt/work/code/python_workspace/kg-geometric/trained_models/trend
+

@@ -3,10 +3,9 @@
 知识图谱模型统一推理引擎
 
 支持自动发现 models/ 目录下所有模型，并为每种模型动态构建推理流程。
-严格遵循 predict1.py 的函数定义、参数传递与模块组织方式。
 
 支持的模型类型：
-- kg_fault_model: 基于 GCN 的知识图谱故障诊断模型
+- kg_fault_model: 基于 FaultRGCN 的知识图谱故障诊断模型
 
 使用方式：
     python predict.py
@@ -19,13 +18,17 @@ import logging
 import random
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 
-from src.core.config import ESConfig, InferenceConfig
-from demo.fault_diagnosis import FaultGCN, KGTripleDataset, topk_fault_diagnosis
+from src.core.config import InferenceConfig, RelationMappingConfig
+from src.model.rgcn import FaultRGCN
+from src.pipeline.inference import DiagnosisResult, infer_from_text
+
+if TYPE_CHECKING:
+    from src.dataset.triple_dataset import KGTripleDataset
 
 # ============================================================
 # 日志配置
@@ -38,15 +41,12 @@ logger = logging.getLogger("KGInference")
 
 
 # ============================================================
-# 1. 工具函数（严格对齐 predict1.py 的函数签名与职责）
+# 1. 工具函数
 # ============================================================
 
 
 def load_model(model_dir: str, params: Optional[dict] = None) -> Dict[str, Any]:
-    """加载模型目录下所有可用模型，返回模型信息汇总。
-
-    对齐 predict1.py.load_model 的签名：(model_dir, params) -> 模型信息。
-    不同之处在于此处返回所有模型的字典，而非单一模型路径。
+    """    加载模型目录下所有可用模型，返回模型信息汇总。
 
     Parameters
     ----------
@@ -78,8 +78,6 @@ def load_model(model_dir: str, params: Optional[dict] = None) -> Dict[str, Any]:
 
 def generate_unique_id() -> str:
     """生成唯一 ID，用于临时目录等场景。
-
-    对齐 predict1.py.generate_unique_id 的实现。
     """
     timestamp = int(time.time() * 1000)
     rand_num = random.randint(0, 1000)
@@ -89,8 +87,6 @@ def generate_unique_id() -> str:
 
 def convert_percent(num: float) -> str:
     """将小数格式化为百分比字符串。
-
-    对齐 predict1.py.convert_percent 的实现。
 
     Parameters
     ----------
@@ -225,18 +221,27 @@ def _get_handler(model_name: str) -> Optional[ModelHandler]:
 # ============================================================
 
 
-class KGFaultModelHandler(ModelHandler):
-    """FaultGCN 知识图谱故障诊断模型处理器。
+class DiagnosisModelHandler(ModelHandler):
+    """知识图谱故障诊断模型处理器（仅支持 FaultRGCN checkpoint）。
+
+    checkpoint 由 ``train.py`` 训练生成，已内嵌完整图结构（dataset /
+    graph_data / node_to_idx / fault_nodes），推理时无需再连接 ES。
+
+    采用与 ``demo/fault_diagnosis.py`` 一致的四阶段推理：语义匹配 → 故障定位
+    → 答案生成 → 结果组装，除 Top-K 故障定位外，还输出每个故障的
+    可能原因（causes）、维修措施（actions）、所需工具（tools）。
 
     输入：换行分隔的症状文本（如 "振动过高\\n温度过高"）
-    输出：Top-K 故障诊断结果（JSON）
-
-    推理逻辑对应 kg_fault_diagnosis.topk_fault_diagnosis。
+    输出：含故障定位与 causes/actions/tools 分析的 JSON
     """
 
-    model_pattern = "kg_fault_model"
+    model_pattern = "diagnosis_model"
 
-    def __init__(self, device: str = "cpu", top_k: int = 3):
+    def __init__(
+            self, device: str = "cpu",
+            top_k: int = 3,
+            symptom_relation: str | None = None,
+    ):
         """
         Parameters
         ----------
@@ -244,14 +249,27 @@ class KGFaultModelHandler(ModelHandler):
             推理设备，支持 "cpu" / "cuda" / "cuda:0" 等。
         top_k : int
             返回 Top-K 故障诊断结果。
+        symptom_relation : str | None
+            症状→故障的语义匹配关系名。为 None 时从 config.yaml 的
+            relation_mapping.symptoms 读取（默认 "表现为"）。
         """
         self.device = device
         self.top_k = top_k
-        self.dataset: Optional[KGTripleDataset] = None
+        self.symptom_relation = symptom_relation
+        self.dataset: Optional["KGTripleDataset"] = None
         self.data: Optional[Any] = None
 
-    def load(self, model_path: str) -> Tuple[FaultGCN, dict]:
-        """加载 FaultGCN 模型及关联数据集。
+    def _detect_model_type(self, checkpoint: dict) -> str:
+        """根据 checkpoint 字段判断模型类型（仅支持 FaultRGCN）。"""
+        if "num_nodes" in checkpoint and "num_relations" in checkpoint:
+            return "rgcn"
+        raise KeyError(
+            "无法识别的 checkpoint 格式，缺少必要字段 (num_nodes/num_relations): "
+            f"got keys={sorted(checkpoint.keys())}"
+        )
+
+    def load(self, model_path: str) -> Tuple[Any, dict]:
+        """加载 FaultRGCN 模型及内嵌的图结构（无需连接 ES）。
 
         Parameters
         ----------
@@ -260,7 +278,7 @@ class KGFaultModelHandler(ModelHandler):
 
         Returns
         -------
-        Tuple[FaultGCN, dict]
+        Tuple[nn.Module, dict]
             (模型实例, 模型元信息)。
         """
         logger.info("正在加载模型: %s", model_path)
@@ -274,156 +292,183 @@ class KGFaultModelHandler(ModelHandler):
                 f"模型文件格式异常，期望 dict，实际为 {type(checkpoint).__name__}"
             )
 
-        # 校验必要字段
-        required_keys = {"model_state_dict", "in_dim", "hidden_dim"}
-        missing = required_keys - set(checkpoint.keys())
-        if missing:
-            raise KeyError(f"模型文件缺少必要字段: {missing}")
-
-        in_dim = checkpoint["in_dim"]
+        model_type = self._detect_model_type(checkpoint)
         hidden_dim = checkpoint["hidden_dim"]
-        num_classes = checkpoint.get("num_classes", 2)
 
-        # 构建模型并加载权重
-        model = FaultGCN(in_dim=in_dim, hidden_dim=hidden_dim)
-        model.load_state_dict(checkpoint["model_state_dict"], strict=False)
-        model.to(self.device)
-        model.eval()
+        if model_type == "rgcn":
+            # ---- 加载 FaultRGCN（由 train.py 训练）----
+            num_nodes = int(checkpoint["num_nodes"])
+            num_relations = int(checkpoint["num_relations"])
+            num_layers = int(checkpoint.get("num_layers", 2))
+            dropout = float(checkpoint.get("dropout", 0.3))
 
-        # 加载内置数据集（含图结构 edge_index / labels）
-        self.dataset = KGTripleDataset(es_config=ESConfig.default())
-        self.data = self.dataset.to_data()
+            model = FaultRGCN(
+                num_nodes=num_nodes,
+                num_relations=num_relations,
+                hidden_dim=hidden_dim,
+                num_layers=num_layers,
+                dropout=dropout,
+            )
+            model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+            model.to(self.device)
+            model.eval()
 
-        # 对齐特征维度：KGFaultDataset 默认生成 torch.eye(num_nodes)，
-        # 但 checkpoint 中的 in_dim 可能不同（如 ES pipeline 训练时用 64 维），
-        # 此处用固定种子生成一致的特征矩阵，使 GCN 第一层维度匹配。
-        actual_feat_dim = self.data.x.size(1)
-        if actual_feat_dim != in_dim:
+            # 直接从 checkpoint 恢复图结构，无需再连 ES
+            if "graph_data" not in checkpoint:
+                raise KeyError(
+                    "checkpoint 缺少 graph_data 字段，请使用最新 train.py 重新训练"
+                    "以将图结构写入模型文件"
+                )
+            self.data = checkpoint["graph_data"]
+
+            # 完整数据集对象（含图遍历映射），用于提取原因/措施/工具
+            if "dataset" not in checkpoint:
+                raise KeyError(
+                    "checkpoint 缺少 dataset 字段，请使用最新 train.py 重新训练"
+                    "以将图遍历映射写入模型文件（支持 causes/actions/tools 分析）"
+                )
+            self.dataset = checkpoint["dataset"]
+            assert self.dataset is not None
+            # 将图遍历所需的边张量移动到推理设备
+            self.dataset.edge_index = self.dataset.edge_index.to(self.device)
+            self.dataset.edge_type = self.dataset.edge_type.to(self.device)
+
+            # FaultRGCN 使用内部的 node_emb 作为输入，无需外部 x
+            # 若数据集节点数与模型不一致，给出警告但继续运行
+            data_num_nodes = int(self.data.num_nodes)
+            if data_num_nodes != num_nodes:
+                logger.warning(
+                    "图结构节点数与模型不匹配: graph=%d, model=%d。"
+                    "推理时将使用现有图结构（嵌入由模型内部 node_emb 提供）。",
+                    data_num_nodes, num_nodes,
+                )
+
+            meta = {
+                "model_type": "rgcn",
+                "num_nodes": num_nodes,
+                "num_relations": num_relations,
+                "hidden_dim": hidden_dim,
+                "num_layers": num_layers,
+                "dropout": dropout,
+                "device": self.device,
+                "fault_nodes": checkpoint["fault_nodes"],
+            }
             logger.info(
-                "特征维度对齐: 数据集 %d → 模型 %d (使用固定种子随机特征)",
-                actual_feat_dim, in_dim,
+                "FaultRGCN 加载成功: nodes=%d, relations=%d, hidden=%d, layers=%d"
+                "（图结构来自本地 checkpoint，未连接 ES）",
+                num_nodes, num_relations, hidden_dim, num_layers,
             )
-            g = torch.Generator().manual_seed(42)
-            self.data.x = torch.randn(
-                self.data.num_nodes, in_dim, generator=g
+
+        else:
+            raise ValueError(
+                f"不支持的模型类型 '{model_type}'，当前仅支持 FaultRGCN checkpoint"
             )
-        if self.device.startswith("cuda"):
+
+        if self.device.startswith("cuda") and self.data is not None:
             self.data = self.data.to(self.device)
 
-        meta = {
-            "in_dim": in_dim,
-            "hidden_dim": hidden_dim,
-            "num_classes": num_classes,
-            "num_nodes": int(self.data.num_nodes) if self.data is not None else 0,
-            "fault_nodes": self.dataset.fault_nodes if self.dataset else [],
-            "device": self.device,
-        }
-
-        logger.info(
-            "FaultGCN 加载成功: in_dim=%d, hidden_dim=%d, num_classes=%d, nodes=%d",
-            in_dim, hidden_dim, num_classes, meta["num_nodes"],
-        )
         return model, meta
 
-    def preprocess(self, instance: str) -> List[str]:
-        """将输入文本解析为症状名称列表。
+    def preprocess(self, instance: str) -> str:
+        """将输入文本解析为查询字符串。
 
-        对齐 predict1.py 中按换行符分割输入文本并校验最小长度的逻辑。
+        支持换行分隔的多个症状（如 "振动过高\\n温度过高"），
+        交由 ``infer_from_text`` 做字符级语义匹配。
 
         Parameters
         ----------
         instance : str
-            换行分隔的症状文本。
+            原始输入文本。
 
         Returns
         -------
-        List[str]
-            去空后的症状名称列表。
+        str
+            去空白后的查询文本。
 
         Raises
         ------
         ValueError
             输入为空时抛出。
         """
-        texts = str(instance).strip().split("\n")
-        symptoms = [t.strip() for t in texts if t.strip()]
-
-        if not symptoms:
+        text = str(instance).strip()
+        if not text:
             raise ValueError("输入为空，请提供至少一个症状")
 
-        logger.info(
-            "预处理完成: 解析出 %d 个症状: %s", len(symptoms), symptoms
-        )
-        return symptoms
+        logger.info("预处理完成: 输入症状文本 (长度=%d)", len(text))
+        return text
 
     def infer(
             self,
-            model: Tuple[FaultGCN, dict],
-            processed_input: List[str],
-    ) -> List[Tuple[str, float]]:
-        """基于症状执行故障诊断推理。
+            model: Tuple[FaultRGCN, dict],
+            processed_input: str,
+    ) -> Optional[DiagnosisResult]:
+        """基于症状文本执行四阶段故障诊断推理（含原因/措施/工具分析）。
+
+        流程与 ``demo/fault_diagnosis.py`` 一致：语义匹配 → 故障定位 →
+        答案生成（causes/actions/tools）→ 结果组装。
 
         Parameters
         ----------
-        model : Tuple[FaultGCN, dict]
+        model : Tuple[FaultRGCN, dict]
             (模型实例, 元信息)。
-        processed_input : List[str]
-            症状名称列表。
+        processed_input : str
+            症状查询文本。
 
         Returns
         -------
-        List[Tuple[str, float]]
-            按置信度降序排列的 (故障名, 分数) 列表。
+        Optional[DiagnosisResult]
+            完整诊断结果；未匹配到任何症状时返回 None。
         """
-        gcn_model, _ = model
+        rgcn_model, _ = model
 
         if self.dataset is None or self.data is None:
-            raise RuntimeError("模型未正确加载，缺少 KGFaultDataset 数据")
+            raise RuntimeError("模型未正确加载，缺少图结构数据")
 
         try:
-            results = topk_fault_diagnosis(
-                gcn_model,
-                self.data,
-                self.dataset.node_to_idx,
-                self.dataset.fault_nodes,
-                processed_input,
-                top_k=self.top_k,
+            result = infer_from_text(
+                model=rgcn_model,
+                dataset=self.dataset,
+                query_text=processed_input,
+                symptom_relation=self.symptom_relation,
+                top_k_symptoms=5,
+                top_k_faults=self.top_k,
+                device=self.device,
             )
         except ValueError as e:
-            logger.warning("推理时症状图中未找到匹配节点: %s", e)
-            return []
+            logger.warning("推理时图谱中未找到匹配节点: %s", e)
+            return None
 
-        logger.info("推理完成: 返回 %d 条诊断结果", len(results))
-        for rank, (fault, score) in enumerate(results, 1):
-            logger.debug("  Top-%d: %s (score=%.4f)", rank, fault, score)
+        logger.info(
+            "推理完成: 最佳故障=%s, %d 原因, %d 措施, %d 工具",
+            result.best_fault,
+            len(result.causes), len(result.actions), len(result.tools),
+        )
+        return result
 
-        return results
-
-    def postprocess(self, raw_result: List[Tuple[str, float]]) -> str:
-        """将 Top-K 故障诊断结果格式化为 JSON 字符串。
-
-        对齐 predict1.py 返回 JSON 字符串的约定。
+    def postprocess(self, raw_result: Optional[DiagnosisResult]) -> str:
+        """将诊断结果格式化为 JSON 字符串（含 causes/actions/tools）。
 
         Parameters
         ----------
-        raw_result : List[Tuple[str, float]]
-            Top-K 诊断结果。
+        raw_result : Optional[DiagnosisResult]
+            四阶段推理结果。
 
         Returns
         -------
         str
-            JSON 字符串。
+            JSON 字符串，包含故障定位、可能原因、维修措施、所需工具等。
         """
-        if not raw_result:
+        if raw_result is None or not raw_result.fault_candidates:
             return json.dumps(
                 {"diagnosis": [], "message": "未找到匹配的故障诊断结果"},
                 ensure_ascii=False,
             )
 
-        best_fault, best_score = raw_result[0]
+        best_fault = raw_result.best_fault
+        best_score = raw_result.fault_candidates[0][1]
 
         diagnosis_list = []
-        for rank, (fault, score) in enumerate(raw_result, 1):
+        for rank, (fault, score) in enumerate(raw_result.fault_candidates, 1):
             diagnosis_list.append({
                 "rank": rank,
                 "fault": fault,
@@ -435,21 +480,36 @@ class KGFaultModelHandler(ModelHandler):
             "diagnosis": diagnosis_list,
             "top_fault": best_fault,
             "top_confidence": convert_percent(float(best_score)),
+            "causes": raw_result.causes,
+            "actions": raw_result.actions,
+            "tools": raw_result.tools,
+            "system": raw_result.system,
+            "category": raw_result.category,
+            "alternative_faults": [
+                {
+                    "fault": alt["fault"],
+                    "confidence": convert_percent(alt["confidence"]),
+                    "score": round(float(alt["confidence"]), 4),
+                    "causes": alt.get("causes", []),
+                    "actions": alt.get("actions", []),
+                    "tools": alt.get("tools", []),
+                }
+                for alt in raw_result.alternative_faults
+            ],
         }
         return json.dumps(result, ensure_ascii=False)
 
 
 # ============================================================
-# 4. 推理入口（严格对齐 predict1.py 的 predict 函数语义）
+# 4. 推理入口
 # ============================================================
 
 
 def predict(model_info: dict, instance: str) -> str:
     """对单个模型执行推理，返回 JSON 结果字符串。
 
-    严格对齐 predict1.py.predict 的函数签名和返回格式：
-    - 参数: (model, instance) — model 为模型信息字典, instance 为输入文本
-    - 返回: JSON 字符串
+    参数: (model, instance) — model 为模型信息字典, instance 为输入文本。
+    返回: JSON 字符串。
 
     Parameters
     ----------
@@ -614,7 +674,7 @@ def predict_all(models_dir: str, instance: str) -> Dict[str, str]:
 
 
 # ============================================================
-# 5. 命令行入口（对齐 predict1.py 的 __main__ 风格）
+# 5. 命令行入口
 # ============================================================
 
 
@@ -663,9 +723,15 @@ def main() -> None:
     args = parser.parse_args()
 
     # ---- 注册模型处理器 ----
+    # symptom_relation 不再通过参数传递，由处理器从 config.yaml 的
+    # relation_mapping.symptoms 读取。
     register_handler(
-        "kg_fault_model",
-        KGFaultModelHandler(device=args.device, top_k=args.top_k),
+        "diagnosis_model",
+        DiagnosisModelHandler(
+            device=args.device,
+            top_k=args.top_k,
+            symptom_relation=RelationMappingConfig.default().mapping.get("symptoms"),
+        ),
     )
 
     # ---- Phase 1: 发现并加载模型 ----
@@ -693,7 +759,7 @@ def main() -> None:
     print(f"  设备     : {args.device}")
     print("=" * 64)
 
-    # ---- Phase 2: 单模型逐一推理（对齐 predict1.py 单次调用风格） ----
+    # ---- Phase 2: 单模型逐一推理 ----
     for idx, mi in enumerate(models, 1):
         print(f"\n{'─' * 50}")
         print(f"  [{idx}/{len(models)}] 模型: {mi['name']}")
@@ -715,10 +781,30 @@ def main() -> None:
         else:
             print(f"  最佳匹配故障 : {result.get('top_fault', 'N/A')}")
             print(f"  置信度       : {result.get('top_confidence', 'N/A')}")
+            causes = result.get("causes", [])
+            actions = result.get("actions", [])
+            tools = result.get("tools", [])
+            if causes:
+                print(f"  可能原因     : {'、'.join(causes)}")
+            if actions:
+                print(f"  维修措施     : {'、'.join(actions)}")
+            if tools:
+                print(f"  所需工具     : {'、'.join(tools)}")
             print(f"  诊断详情     :")
             for d in result.get("diagnosis", []):
                 bar = "█" * max(1, int(float(d.get("confidence", "0%").rstrip("%")) / 5))
                 print(f"    Top-{d['rank']}: {d['fault']:<12} {d['confidence']:>8} {bar}")
+            alts = result.get("alternative_faults", [])
+            if alts:
+                print(f"  备选故障     :")
+                for alt in alts:
+                    extra = []
+                    if alt.get("causes"):
+                        extra.append(f"原因: {'、'.join(alt['causes'][:3])}")
+                    if alt.get("actions"):
+                        extra.append(f"措施: {'、'.join(alt['actions'][:3])}")
+                    suffix = f" ({'；'.join(extra)})" if extra else ""
+                    print(f"    - {alt['fault']} ({alt['confidence']}){suffix}")
         print(f"  耗时         : {elapsed:.3f}s")
 
     # ---- Phase 3: 全模型批量推理 ----
