@@ -224,3 +224,8 @@ build
 /models
 .codebuddy
 /data
+
+
+# Models
+/trained_models/
+*/trained_models/

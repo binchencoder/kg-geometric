@@ -407,8 +407,11 @@ def run_fault_prediction_training(
             tgn_model.state_dict(),
             os.path.join(save_dir, "temporal_tgn.pth"),
         )
+        # 将时序异构图随模型一起持久化：推理时直接加载本文件，无需再读取 CSV
+        torch.save(hetero_data.cpu(), os.path.join(save_dir, "temporal_kg_graph.pt"))
         logger.info(
-            "故障预测 | 模型已保存至: %s/{temporal_diag_rgcn.pth, temporal_tgn.pth}",
+            "故障预测 | 模型与知识图谱已保存至: %s/"
+            "{temporal_diag_rgcn.pth, temporal_tgn.pth, temporal_kg_graph.pt}",
             save_dir,
         )
 
