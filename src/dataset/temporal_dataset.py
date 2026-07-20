@@ -48,9 +48,16 @@ from src.core.config import load_health_mapping, logger  # noqa: E402
 # ---------------------------------------------------------------------------
 # 健康状态标签映射（从 config/config.yaml 读取）
 # ---------------------------------------------------------------------------
+# 懒加载：首次调用 get_health_mapping() 时才读取配置并打日志，
+# 避免本模块被 import 时（如 src/tkgl 仅需要 src.dataset.tkgl_dataset）
+# 就触发整条 src 包导入链并输出无关 INFO 日志。
 
-HEALTH_MAPPING: Dict[int, str] = load_health_mapping()
-HEALTH_NUM = len(HEALTH_MAPPING)
+def get_health_mapping() -> Dict[int, str]:
+    """返回健康状态标签映射（dict[int, str]），首次调用时从 config.yaml 加载并缓存。"""
+    if get_health_mapping._cache is None:
+        get_health_mapping._cache = load_health_mapping()
+    return get_health_mapping._cache
+get_health_mapping._cache = None
 
 
 class KGTemporalDataset:
@@ -181,8 +188,8 @@ class KGTemporalDataset:
         self.device = self._resolve_device(device)
 
         # 健康状态映射（与列配置无关的行业语义标签）
-        self.health_mapping: Dict[int, str] = dict(HEALTH_MAPPING)
-        self.health_num = HEALTH_NUM
+        self.health_mapping: Dict[int, str] = dict(get_health_mapping())
+        self.health_num = len(get_health_mapping())
 
         # 由配置推导的必需列（不再写死在模块顶层）
         self._required_cols = (
@@ -1011,8 +1018,8 @@ def build_transformer_kg(
     dataset.target_severe_threshold = float(target_severe_threshold)
     dataset.future_steps = future_steps
     dataset.device = KGTemporalDataset._resolve_device(device)
-    dataset.health_mapping = dict(HEALTH_MAPPING)
-    dataset.health_num = HEALTH_NUM
+    dataset.health_mapping = dict(get_health_mapping())
+    dataset.health_num = len(get_health_mapping())
     dataset._required_cols = (
         {date_col, target_col} | set(overload_cols)
     )
