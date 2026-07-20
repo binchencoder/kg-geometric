@@ -14,7 +14,7 @@ TKGL-Smallpedia 时序知识图谱链接预测 —— 推理与评测
   * run_inference          : 推理主流程（加载 checkpoint → 手动/评测/示例）
   * main                   : 命令行入口
 
-模型与 checkpoint 序列化见 src/model/temporal_model.py；数据集加载见 src/dataset/tkgl_dataset.py。
+模型与 checkpoint 序列化见 src/model/tkgl.py；数据集加载见 src/dataset/tkgl_dataset.py。
 """
 
 import os
@@ -31,7 +31,7 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from src.model.tkgl_model import load_checkpoint, TemporalKGModel  # noqa: E402
+from src.model.tkgl import load_checkpoint, TemporalKGModel  # noqa: E402
 
 
 # ====================================================================

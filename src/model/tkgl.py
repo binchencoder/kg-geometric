@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-src/model/temporal_model.py
+src/model/tkgl.py
 =====================================================================
 TKGL-Smallpedia 时序知识图谱链接预测 —— 模型与 checkpoint 序列化
 

@@ -10,7 +10,7 @@ TKGL-Smallpedia 时序知识图谱链接预测 —— 训练
   * run_training            : 训练主流程（加载数据 → 建模型 → 训练 → 评测 → 保存）
   * main                    : 命令行入口
 
-模型见 src/model/temporal_model.py；数据集加载见 src/dataset/tkgl_dataset.py；
+模型见 src/model/tkgl.py；数据集加载见 src/dataset/tkgl_dataset.py；
 过滤式评测 evaluate_filtered 见 src/tkgl/predict.py。
 """
 
@@ -33,7 +33,7 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from src.model.tkgl_model import TemporalKGModel, save_checkpoint  # noqa: E402
+from src.model.tkgl import TemporalKGModel, save_checkpoint  # noqa: E402
 from src.dataset.tkgl_dataset import load_tkgl_smallpedia, iter_train_batches  # noqa: E402
 
 # 过滤式评测（训练期 val 监控用）；predict 模块本身只依赖 temporal_model，
