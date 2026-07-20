@@ -16,13 +16,11 @@ TKGL-Smallpedia 时序知识图谱链接预测 —— 训练
 
 import os
 import sys
-import math
 import time
 import argparse
 
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 
 # 项目根目录加入 sys.path，使以脚本方式运行本文件时 `import src.model...` /
@@ -38,10 +36,7 @@ from src.dataset.tkgl_dataset import load_tkgl_smallpedia, iter_train_batches  #
 
 # 过滤式评测（训练期 val 监控用）；predict 模块本身只依赖 temporal_model，
 # 不会产生循环依赖。
-try:
-    from src.tkgl.predict import evaluate_filtered, _build_relation_endpoints, _get_relation_tail_set
-except ModuleNotFoundError:  # 直接以脚本方式运行且 src 不在 path 时的兜底
-    from src.tkgl.predict import evaluate_filtered, _build_relation_endpoints, _get_relation_tail_set
+from src.tkgl.predict import evaluate_filtered, _build_relation_endpoints, _get_relation_tail_set  # noqa: E402
 
 
 # ====================================================================
