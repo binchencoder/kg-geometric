@@ -82,6 +82,11 @@ class KGTemporalDataset:
         目标列的严重过热阈值（真实单位）；不传时取 95 百分位。
     future_steps : int, default 3
         目标列的超前预测步数。
+    chunk_size : int, default 0
+        分块流式读取的块大小（行数）。>0 时启用**流式读取**，避免一次性
+        把超大 CSV 全量载入内存；峰值内存仅与 chunk_size 成正比。
+    reservoir_size : int, default 200000
+        流式模式下用于估计百分位阈值（80/95 百分位过热阈值）的蓄水池采样上限。
     device : torch.device | str | None, default None
         HeteroData 最终落盘的设备；默认使用 CUDA 如可用否则 CPU。
     """
@@ -101,10 +106,16 @@ class KGTemporalDataset:
             target_mild_threshold: Optional[float] = None,
             target_severe_threshold: Optional[float] = None,
             future_steps: int = 3,
+            chunk_size: int = 0,
+            reservoir_size: int = 200000,
             device=None,
     ) -> None:
         self.csv_path = csv_path
         self.transformer_id = transformer_id
+        # 流式读取开关：chunk_size>0 即启用分批读取
+        self.chunk_size = int(chunk_size)
+        self.streaming = self.chunk_size > 0
+        self.reservoir_size = int(reservoir_size)
 
         # ---------- 轻量 CSV 预读：用于自动检测列名、推断统计阈值 ----------
         # 只读前 200 行足以做 dtype 检测与简单统计，避免加载大文件
@@ -126,31 +137,45 @@ class KGTemporalDataset:
         self.overload_cols: List[str] = list(overload_cols)
 
         # ---------- 阈值自动推断 ----------
-        # 过载阈值：若用户未显式指定，按"均值 + 2σ"从预读样本估计
-        if self.overload_cols and overload_thresholds is None:
-            overload_thresholds = KGTemporalDataset._infer_thresholds(
-                sample, self.overload_cols
-            )
-        elif overload_thresholds is None:
-            overload_thresholds = []
-        if len(self.overload_cols) != len(overload_thresholds):
+        # 流式模式下，阈值推迟到流式扫描时基于「全量数据」统计（更准确），
+        # 这里仅处理「非流式」或「用户显式给定」的情况。
+        if overload_thresholds is None:
+            if not self.streaming:
+                # 非流式：按"均值 + 2σ"从预读样本估计
+                overload_thresholds = (
+                    KGTemporalDataset._infer_thresholds(sample, self.overload_cols)
+                    if self.overload_cols else []
+                )
+            else:
+                # 流式：留空，由 _load_and_preprocess_streaming 基于全量数据估算
+                overload_thresholds = None
+        # 仅当显式给定阈值时才做长度校验（流式估算的结果天然一致）
+        if overload_thresholds is not None and len(self.overload_cols) != len(overload_thresholds):
             raise ValueError(
                 "overload_cols 与 overload_thresholds 长度必须一致："
                 f"{len(self.overload_cols)} vs {len(overload_thresholds)}"
             )
-        self.overload_thresholds: List[float] = list(overload_thresholds)
+        self.overload_thresholds: List[float] = (
+            list(overload_thresholds) if overload_thresholds is not None else []
+        )
 
-        # 目标列过热阈值：未显式指定时按 80/95 百分位从预读样本估计
+        # 目标列过热阈值：未显式指定时，非流式从预读样本估计；
+        # 流式模式留 None，由流式扫描基于全量数据估 80/95 百分位。
         if target_mild_threshold is None or target_severe_threshold is None:
-            mild, severe = KGTemporalDataset._infer_target_thresholds(
-                sample, self.target_col
-            )
-            if target_mild_threshold is None:
-                target_mild_threshold = mild
-            if target_severe_threshold is None:
-                target_severe_threshold = severe
-        self.target_mild_threshold = float(target_mild_threshold)
-        self.target_severe_threshold = float(target_severe_threshold)
+            if not self.streaming:
+                mild, severe = KGTemporalDataset._infer_target_thresholds(
+                    sample, self.target_col
+                )
+                if target_mild_threshold is None:
+                    target_mild_threshold = mild
+                if target_severe_threshold is None:
+                    target_severe_threshold = severe
+        self.target_mild_threshold = (
+            float(target_mild_threshold) if target_mild_threshold is not None else None
+        )
+        self.target_severe_threshold = (
+            float(target_severe_threshold) if target_severe_threshold is not None else None
+        )
 
         self.future_steps = future_steps
         self.device = self._resolve_device(device)
@@ -354,6 +379,8 @@ class KGTemporalDataset:
     def _load_and_preprocess(self):
         """加载 CSV、生成健康状态标签、标准化特征。
 
+        当 ``chunk_size > 0``（流式模式）时，改为分块读取以控制峰值内存。
+
         Returns
         -------
         df_train : pd.DataFrame
@@ -363,6 +390,9 @@ class KGTemporalDataset:
         feat_mean : np.ndarray shape (feature_num,)
         feat_std  : np.ndarray shape (feature_num,)
         """
+        if self.streaming:
+            return self._load_and_preprocess_streaming()
+
         if not os.path.exists(self.csv_path):
             raise FileNotFoundError(f"CSV 文件不存在: {self.csv_path}")
 
@@ -428,6 +458,239 @@ class KGTemporalDataset:
             self.csv_path,
             len(df_train),
             self.feature_num,
+        )
+        return df_train, df_raw, feat_mean, feat_std
+
+    # ------------------------------------------------------------------
+    # 流式读取辅助：Welford 在线统计 + 蓄水池采样
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _welford_merge(state: List[float], vals: np.ndarray) -> None:
+        """把一批数值（允许含 NaN）合并进 Welford 状态 [count, mean, M2]。
+
+        使用并行合并公式，全程向量化，避免逐元素 Python 循环。
+        """
+        vals = vals[~np.isnan(vals)]
+        if vals.size == 0:
+            return
+        n = vals.size
+        mean = float(vals.mean())
+        m2 = float(((vals - mean) ** 2).sum())
+        count, mean_old, m2_old = state
+        if count == 0:
+            state[0], state[1], state[2] = n, mean, m2
+            return
+        count_new = count + n
+        delta = mean - mean_old
+        mean_new = (count * mean_old + n * mean) / count_new
+        m2_new = m2_old + m2 + delta * delta * count * n / count_new
+        state[0], state[1], state[2] = count_new, mean_new, m2_new
+
+    @staticmethod
+    def _welford_mean(state: List[float]) -> float:
+        return state[1]
+
+    @staticmethod
+    def _welford_std(state: List[float]) -> float:
+        # 使用样本标准差(ddof=1)，与 pandas .std() 默认行为保持一致
+        if state[0] < 2:
+            return 0.0
+        return float(np.sqrt(state[2] / (state[0] - 1)))
+
+    @staticmethod
+    def _reservoir_update(reservoir: List[float], vals: np.ndarray,
+                          cap: int, rng: np.random.Generator) -> None:
+        """有界蓄水池采样：满 cap 后以随机替换方式维持统计代表性。
+
+        用于在不持有全量数据的前提下估计 target_col 的百分位阈值。
+        每批最多取 5000 个样本参与，限制超大文件下的采样开销。
+        """
+        vals = vals[~np.isnan(vals)]
+        if vals.size == 0:
+            return
+        if vals.size > 5000:
+            vals = vals[rng.integers(0, vals.size, size=5000)]
+        for v in vals.tolist():
+            if len(reservoir) < cap:
+                reservoir.append(float(v))
+            else:
+                reservoir[int(rng.integers(0, len(reservoir)))] = float(v)
+
+    @staticmethod
+    def _reservoir_percentiles(reservoir: List[float], qs) -> List[float]:
+        arr = np.asarray(reservoir, dtype=np.float64)
+        return [float(np.percentile(arr, q)) for q in qs]
+
+    # ------------------------------------------------------------------
+    # 流式读取主流程
+    # ------------------------------------------------------------------
+    def _load_and_preprocess_streaming(self):
+        """分块流式读取超大 CSV，峰值内存仅与 chunk_size 成正比。
+
+        采用两遍流式扫描（文件被顺序读两遍，避免同时持有全量数据）：
+
+        * 第 1 遍：用 Welford 在线算法累计各特征的均值/标准差；用蓄水池采样
+          保留 target_col 的一个有界样本，用于估计 80/95 百分位过热阈值；
+          过载阈值（若未显式给定）按"全量均值 + 2σ"估算。
+        * 第 2 遍：逐块做健康标签、未来值平移、z-score 标准化，并追加到列式
+          数组；最后拼接成与全量读取结构完全一致的 DataFrame，交给
+          ``_build_hetero_graph``（无需改动建图逻辑）。
+
+        说明：模型输入（time_slice 节点特征）本身占 O(N·F) 内存，这是推理所需、
+        无法避免的；流式读取的意义在于避免「原始 DataFrame + 副本 + 标准化副本」
+        同时驻留，把峰值内存从约数倍数据降到约 1 倍，从而支持任意大的 CSV
+        （只要单块能放进内存）。若需进一步突破内存上限，应配合磁盘缓存 +
+        邻居采样的小批量训练（见 train_joint_rgcn_tgn 的 batch_size 参数说明）。
+        """
+        if not os.path.exists(self.csv_path):
+            raise FileNotFoundError(f"CSV 文件不存在: {self.csv_path}")
+
+        feature_cols = self.feature_list
+        overload_cols = self.overload_cols
+        target_col = self.target_col
+        date_col = self.date_col
+        rng = np.random.default_rng(42)
+
+        # ---------- 第 1 遍：在线统计 + 蓄水池采样 ----------
+        welford = {c: [0, 0.0, 0.0]
+                   for c in feature_cols + overload_cols + [target_col]}
+        reservoir: List[float] = []
+
+        reader = pd.read_csv(self.csv_path, chunksize=self.chunk_size)
+        for chunk in reader:
+            for c in welford:
+                self._welford_merge(
+                    welford[c],
+                    pd.to_numeric(chunk[c], errors="coerce").to_numpy(dtype=np.float64),
+                )
+            self._reservoir_update(
+                reservoir,
+                pd.to_numeric(chunk[target_col], errors="coerce").to_numpy(dtype=np.float64),
+                self.reservoir_size, rng,
+            )
+
+        # 最终化阈值
+        feat_mean = np.array(
+            [self._welford_mean(welford[c]) for c in feature_cols], dtype=np.float32
+        )
+        feat_std = np.array(
+            [self._welford_std(welford[c]) for c in feature_cols], dtype=np.float32
+        )
+        feat_std = np.where(feat_std < 1e-6, 1.0, feat_std)  # 常数列保护
+
+        if self.target_mild_threshold is None or self.target_severe_threshold is None:
+            mild, severe = self._reservoir_percentiles(reservoir, [80, 95])
+            if self.target_mild_threshold is None:
+                self.target_mild_threshold = float(mild)
+            if self.target_severe_threshold is None:
+                self.target_severe_threshold = float(severe)
+
+        if overload_cols and not self.overload_thresholds:
+            self.overload_thresholds = [
+                float(self._welford_mean(welford[c]) + 2.0 * self._welford_std(welford[c]))
+                for c in overload_cols
+            ]
+
+        # ---------- 第 2 遍：逐块处理并追加 ----------
+        feat_raw_chunks: List[np.ndarray] = []   # 各块原始特征矩阵
+        target_chunks: List[np.ndarray] = []     # 各块 target 原始值
+        overload_chunks: List[np.ndarray] = []   # 各块 overload 原始值
+        health_chunks: List[np.ndarray] = []     # 各块健康标签
+        date_list: List[str] = []                # 各块日期字符串
+
+        reader = pd.read_csv(self.csv_path, chunksize=self.chunk_size)
+        for chunk in reader:
+            chunk = chunk.copy()
+            chunk[date_col] = pd.to_datetime(chunk[date_col])
+            tvals = pd.to_numeric(
+                chunk[target_col], errors="coerce"
+            ).to_numpy(dtype=np.float32)
+
+            # 健康标签（矢量，按行）
+            labels = np.zeros(len(chunk), dtype=np.int64)
+            labels[
+                (tvals >= self.target_mild_threshold)
+                & (tvals < self.target_severe_threshold)
+            ] = 1
+            labels[tvals >= self.target_severe_threshold] = 2
+            if overload_cols:
+                ov_mask = np.zeros(len(chunk), dtype=bool)
+                for c, thr in zip(overload_cols, self.overload_thresholds):
+                    ov = pd.to_numeric(
+                        chunk[c], errors="coerce"
+                    ).to_numpy(dtype=np.float32)
+                    ov_mask |= (ov > thr)
+                labels[ov_mask] = 3
+
+            fraw = chunk[feature_cols].to_numpy(dtype=np.float32)
+
+            feat_raw_chunks.append(fraw)
+            target_chunks.append(tvals)
+            if overload_cols:
+                overload_chunks.append(np.stack(
+                    [pd.to_numeric(chunk[c], errors="coerce").to_numpy(dtype=np.float32)
+                     for c in overload_cols], axis=1))
+            health_chunks.append(labels)
+            date_list.extend(
+                chunk[date_col].dt.strftime("%Y-%m-%d %H:%M:%S").tolist()
+            )
+
+        # ---------- 拼接 + 平移 + 标准化 ----------
+        feat_raw_all = np.concatenate(feat_raw_chunks, axis=0)        # (N, F)
+        feat_std_all = (feat_raw_all - feat_mean) / feat_std         # 标准化
+        target_all = np.concatenate(target_chunks, axis=0)           # (N,)
+        health_all = np.concatenate(health_chunks, axis=0)           # (N,)
+        if overload_cols:
+            overload_all = np.concatenate(overload_chunks, axis=0)
+        date_all = date_list
+
+        # 未来值平移：跨块边界由全量拼接自然处理
+        future_col = f"future_{target_col}"
+        future_all = np.concatenate([
+            target_all[self.future_steps:],
+            np.full(self.future_steps, np.nan, dtype=np.float32),
+        ])
+
+        # 丢弃尾部 future_steps 行（无未来标签）
+        keep = ~np.isnan(future_all)
+        feat_raw_all = feat_raw_all[keep]
+        feat_std_all = feat_std_all[keep]
+        target_all = target_all[keep]
+        health_all = health_all[keep]
+        future_all = future_all[keep]
+        date_all = [d for d, k in zip(date_all, keep) if k]
+        if overload_cols:
+            overload_all = overload_all[keep]
+
+        slice_num = feat_raw_all.shape[0]
+        if slice_num < 2:
+            raise ValueError(
+                "有效时序切片不足 2，无法构建相邻时序边："
+                f"流式读取后剩余 {slice_num} 行"
+            )
+
+        # 组装成与全量读取结构一致的 DataFrame，使 _build_hetero_graph 无需改动
+        df_raw = pd.DataFrame(feat_raw_all, columns=feature_cols)
+        df_raw[target_col] = target_all
+        df_raw[date_col] = pd.to_datetime(date_all)
+        df_raw["health_label"] = health_all
+        df_raw[future_col] = future_all
+        if overload_cols:
+            for c, col_arr in zip(overload_cols, overload_all.T):
+                df_raw[c] = col_arr
+
+        df_train = df_raw.copy()
+        df_train[feature_cols] = feat_std_all
+
+        self.df_train = df_train
+        self.df_raw = df_raw
+        self.feat_mean = feat_mean
+        self.feat_std = feat_std
+        self.slice_num = slice_num
+
+        logger.info(
+            "CSV 流式加载完成: %s | 有效切片=%d | 特征数=%d | chunk_size=%d",
+            self.csv_path, slice_num, self.feature_num, self.chunk_size,
         )
         return df_train, df_raw, feat_mean, feat_std
 

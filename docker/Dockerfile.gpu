@@ -1,0 +1,43 @@
+# =====================================================================
+# TKGL-Smallpedia 时序知识图谱链接预测 —— GPU 运行镜像
+# 基于 PyTorch 官方 CUDA 镜像（已含 torch + numpy + CUDA 运行时），
+# 无需再安装 torch，构建更快、镜像更稳。
+#
+# 构建（构建上下文 = 项目根目录）：
+#   docker build -t tkgl-smallpedia:gpu -f docker/Dockerfile.gpu .
+#
+# 运行（需宿主机装好 nvidia-container-toolkit / 驱动）：
+#   docker run --rm --gpus all \
+#     -v "$PWD/data:/app/data" -v "$PWD/trained_models:/app/trained_models" \
+#     tkgl-smallpedia:gpu --mode train --force --neg-mode uniform \
+#     --data-dir /app/data/tkgl-smallpedia-crop35
+# =====================================================================
+
+FROM pytorch/pytorch:2.2.2-cuda12.1-cudnn8-runtime
+
+# 避免交互式安装卡住
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+WORKDIR /app
+
+# ---------- 依赖安装 ----------
+# 基础镜像已含 torch(CUDA) + numpy；仅需确认 numpy 版本满足脚本要求。
+COPY docker/requirements.docker.txt /app/requirements.docker.txt
+RUN pip install --no-cache-dir -r /app/requirements.docker.txt
+
+# ---------- 拷贝脚本运行所需代码（不含数据 / 训练产物）----------
+COPY demo/ /app/demo/
+COPY data/tkgl-smallpedia/ /app/data/tkgl-smallpedia/
+
+# 默认数据目录（容器内相对路径，与脚本默认 --data-dir 一致）。
+# 运行时请用 -v 把宿主机数据集挂载到 /app/data。
+VOLUME ["/app/data", "/app/trained_models"]
+
+# 入口：直接运行该脚本，所有参数透传（train / infer / --head ... 等）
+# 脚本内部用 torch.cuda.is_available() 自动启用 GPU。
+#ENTRYPOINT ["python", "demo/tkgl_smallpedia_tkg.py"]
+
+# 默认动作：推理（若已挂载训练好的模型）；训练时覆盖为 --mode train
+#CMD ["--mode", "infer"]

@@ -320,6 +320,8 @@ def run_fault_prediction_training(
         device: torch.device | str = "cpu",
         random_state: int = 42,
         save_dir: str | None = None,
+        chunk_size: int = 0,
+        batch_size: int = 0,
 ) -> tuple[_TemporalRGCNDiag, TGNOilTemperaturePredict, torch.Tensor, torch.Tensor, HeteroData]:
     """加载 CSV → 构建时序异构图 → 联合训练 R-GCN（健康状态）+ TGN（油温+风险）。
 
@@ -331,10 +333,16 @@ def run_fault_prediction_training(
 
     # ---- 1. 加载数据：KGTemporalDataset 会自动检测列、推断阈值 ----
     logger.info("故障预测 | 从 CSV 加载时序数据: %s", csv_path)
+    if chunk_size and chunk_size > 0:
+        logger.info(
+            "故障预测 | 启用分块流式读取 (chunk_size=%d)，适合超大 CSV，峰值内存与块大小成正比",
+            chunk_size,
+        )
     kg_dataset = KGTemporalDataset(
         csv_path=csv_path,
         transformer_id=transformer_id,
         device=device,
+        chunk_size=chunk_size,
     )
     hetero_data = kg_dataset.data
     total_num = kg_dataset.slice_num
@@ -386,6 +394,7 @@ def run_fault_prediction_training(
         lr=lr,
         log_interval=10,
         hold_out_n=hold_out_n,
+        batch_size=batch_size,
         verbose=True,
     )
 
@@ -569,6 +578,12 @@ def _parse_args(
                         help=f"[预测] 隐藏层维度 (默认来自 config.yaml: {pred_cfg.hidden_dim})")
     parser.add_argument("--pred-save-dir", type=str, default=pred_cfg.save_model_path,
                         help="[预测] 模型保存目录 (如 ./models/temporal)")
+    parser.add_argument("--pred-chunk-size", type=int, default=0,
+                        help="[预测] CSV 分块流式读取的块大小(行数)；>0 时启用，"
+                             "适合超大 CSV，峰值内存与块大小成正比 (默认 0=全量读取)")
+    parser.add_argument("--pred-batch-size", type=int, default=0,
+                        help="[预测] 训练小批量大小；>0 且 < 训练样本数时启用梯度累积式"
+                             "小批量训练 (默认 0=全量)")
 
     # ---- 推理参数 ----
     parser.add_argument("--no-infer", action="store_true", default=True,
@@ -686,6 +701,8 @@ def main() -> None:
                 lr=args.pred_lr,
                 device=device,
                 save_dir=args.pred_save_dir,
+                chunk_size=args.pred_chunk_size,
+                batch_size=args.pred_batch_size,
             )
         )
 

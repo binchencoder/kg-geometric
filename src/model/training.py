@@ -16,6 +16,7 @@ import copy
 import random
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
 from sklearn.metrics import accuracy_score, classification_report, f1_score, mean_absolute_error
@@ -378,6 +379,7 @@ def train_tgn(
         epochs: int = 100,
         lr: float = 1e-3,
         log_interval: int = 10,
+        batch_size: int = 0,
         verbose: bool = True,
 ) -> Tuple[nn.Module, Dict[str, float]]:
     """独立训练 TGN 模型（油温回归 + 故障风险二分类，双任务）。
@@ -417,16 +419,37 @@ def train_tgn(
     if verbose:
         print("\n===== 开始训练 TGN 时序趋势预测 =====")
 
+    train_idx_list = train_idx.tolist()
+    use_batch = batch_size and batch_size > 0 and batch_size < len(train_idx_list)
+    rng = np.random.default_rng(42) if use_batch else None
+
     for epoch in range(epochs):
         tgn_model.train()
         optimizer.zero_grad()
         future_ot_pred, fault_risk_pred, _ = tgn_model(hetero_data)
 
-        loss = loss_ot(
-            future_ot_pred.squeeze()[train_idx], y_ot_norm[train_idx],
-        ) + loss_risk(fault_risk_pred.squeeze()[train_idx], risk_label[train_idx])
-        loss.backward()
-        optimizer.step()
+        if use_batch:
+            # 梯度累积式小批量（全图前向一次，逐批 backward 累加）
+            perm = rng.permutation(len(train_idx_list))
+            batches = [perm[b:b + batch_size]
+                       for b in range(0, len(perm), batch_size)]
+            total_loss_val = 0.0
+            for bi, b in enumerate(batches):
+                bidx = torch.as_tensor(b, dtype=torch.long, device=future_ot_pred.device)
+                b_loss = loss_ot(
+                    future_ot_pred.squeeze()[bidx], y_ot_norm[bidx],
+                ) + loss_risk(fault_risk_pred.squeeze()[bidx], risk_label[bidx])
+                b_loss.backward(retain_graph=(bi < len(batches) - 1))
+                total_loss_val += b_loss.item() * bidx.numel()
+            optimizer.step()
+            total_loss = total_loss_val / len(train_idx_list)
+        else:
+            loss = loss_ot(
+                future_ot_pred.squeeze()[train_idx], y_ot_norm[train_idx],
+            ) + loss_risk(fault_risk_pred.squeeze()[train_idx], risk_label[train_idx])
+            loss.backward()
+            optimizer.step()
+            total_loss = loss
 
         if (epoch + 1) % log_interval == 0 or epoch == epochs - 1:
             with torch.no_grad():
@@ -450,7 +473,7 @@ def train_tgn(
 
             if verbose:
                 print(
-                    f"Epoch:{epoch + 1:3d} | Loss:{loss.item():.4f} "
+                    f"Epoch:{epoch + 1:3d} | Loss:{float(total_loss):.4f} "
                     f"| OT_MAE:{ot_mae:.4f} | RiskAcc:{risk_acc:.4f}"
                 )
 
@@ -471,6 +494,7 @@ def train_joint_rgcn_tgn(
         lr: float = 1e-3,
         log_interval: int = 10,
         hold_out_n: int = 0,
+        batch_size: int = 0,
         verbose: bool = True,
 ) -> Tuple[nn.Module, nn.Module, Dict[str, float]]:
     """联合训练 R-GCN（故障诊断，分类）+ TGN（油温+风险，双任务）。
@@ -521,28 +545,61 @@ def train_joint_rgcn_tgn(
     best_tgn_state: Optional[Dict] = None
     metrics: Dict[str, float] = {}
 
+    # ---- 小批量设置 ----
+    # batch_size>0 且 < 训练样本数时，启用「梯度累积式」小批量：
+    # 每轮只做一次全图前向（R-GCN/TGN 均为全图模型，消息传递需要整图结构），
+    # 再把 train_idx 拆成若干批次逐批 backward 累加梯度，最后统一 step。
+    # 这样在「峰值显存≈一次全图前向」的前提下，用 mini-batch 控制单步梯度噪声，
+    # 并天然支持超大训练集（无需一次性持有全部样本的损失张量）。
+    # 注意：若需进一步压低峰值显存，应改用 PyG 的 NeighborLoader 做邻居采样
+    # 的逐子图训练（更大的重构），本函数当前保持全图前向以兼容现有模型。
+    train_idx_list = train_idx.tolist()
+    use_batch = batch_size and batch_size > 0 and batch_size < len(train_idx_list)
+    rng = np.random.default_rng(42) if use_batch else None
+
     if verbose:
-        print("\n===== 开始联合训练 R-GCN故障诊断 + TGN时序趋势预测 =====")
+        mode = f"小批量(batch_size={batch_size})" if use_batch else "全量"
+        print(f"\n===== 开始联合训练 R-GCN故障诊断 + TGN时序趋势预测 [{mode}] =====")
 
     for epoch in range(epochs):
         diag_model.train()
         tgn_model.train()
         optimizer.zero_grad()
 
-        # ---- 前向传播 ----
+        # ---- 前向传播（全图一次，供各批次共享）----
         health_logits, _ = diag_model(
             hetero_data.x_dict, hetero_data.edge_index_dict,
         )
         future_ot_pred, fault_risk_pred, _ = tgn_model(hetero_data)
 
-        # ---- 多任务损失 ----
-        loss1 = loss_cls(health_logits[train_idx], y_health[train_idx])
-        loss2 = loss_ot(future_ot_pred.squeeze()[train_idx], y_ot_norm[train_idx])
-        loss3 = loss_risk(fault_risk_pred.squeeze()[train_idx], risk_label[train_idx])
-        total_loss = loss1 + loss2 + loss3
+        if use_batch:
+            # 梯度累积：逐批 backward 累加，仅最后一批释放计算图
+            perm = rng.permutation(len(train_idx_list))
+            batches = [perm[b:b + batch_size]
+                       for b in range(0, len(perm), batch_size)]
+            total_loss_val = 0.0
+            for bi, b in enumerate(batches):
+                bidx = torch.as_tensor(
+                    b, dtype=torch.long, device=health_logits.device
+                )
+                b_loss = (
+                    loss_cls(health_logits[bidx], y_health[bidx])
+                    + loss_ot(future_ot_pred.squeeze()[bidx], y_ot_norm[bidx])
+                    + loss_risk(fault_risk_pred.squeeze()[bidx], risk_label[bidx])
+                )
+                b_loss.backward(retain_graph=(bi < len(batches) - 1))
+                total_loss_val += b_loss.item() * bidx.numel()
+            optimizer.step()
+            total_loss = total_loss_val / len(train_idx_list)  # 平均 loss，用于日志
+        else:
+            # ---- 多任务损失（全量）----
+            loss1 = loss_cls(health_logits[train_idx], y_health[train_idx])
+            loss2 = loss_ot(future_ot_pred.squeeze()[train_idx], y_ot_norm[train_idx])
+            loss3 = loss_risk(fault_risk_pred.squeeze()[train_idx], risk_label[train_idx])
+            total_loss = loss1 + loss2 + loss3
 
-        total_loss.backward()
-        optimizer.step()
+            total_loss.backward()
+            optimizer.step()
 
         # ---- 评估（不切换 eval，避免 TGN msg_store 刷新导致二次 backward 失败） ----
         with torch.no_grad():
@@ -574,7 +631,7 @@ def train_joint_rgcn_tgn(
 
         if verbose and ((epoch + 1) % log_interval == 0 or epoch == epochs - 1):
             print(
-                f"Epoch:{epoch + 1:3d} | TotalLoss:{total_loss.item():.4f} "
+                f"Epoch:{epoch + 1:3d} | TotalLoss:{float(total_loss):.4f} "
                 f"| DiagAcc:{diag_acc:.4f} | OT_MAE:{ot_mae:.4f} "
                 f"| RiskAcc:{risk_acc:.4f}"
             )

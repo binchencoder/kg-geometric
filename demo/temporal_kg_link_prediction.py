@@ -289,7 +289,12 @@ class TimeEncoder(nn.Module):
         super().__init__()
         self.dim = dim
         self.linear = nn.Linear(1, dim)                       # 线性部分
-        self.freq = nn.Parameter(torch.randn(dim) * 5.0)      # 正弦频率
+        # 时间坐标通常是「年份/天数」量级(如 2000+)。若线性权重用默认初始化(std=1)，
+        # linear(t) 会达到数千，使时间编码与下游 DistMult 分数发散、loss 爆到数万。
+        # 因此把线性权重初始化得很小，让时间编码始终保持在 O(1)，避免数值发散。
+        nn.init.normal_(self.linear.weight, 0.0, 0.1)
+        nn.init.normal_(self.linear.bias, 0.0, 0.1)
+        self.freq = nn.Parameter(torch.randn(dim) * 1.0)      # 正弦频率(适中，避免高频梯度过大)
         self.phase = nn.Parameter(torch.randn(dim))           # 正弦相位
 
     def forward(self, t):
@@ -309,24 +314,34 @@ class TimeEncoder(nn.Module):
 # ====================================================================
 class TemporalKGModel(nn.Module):
     def __init__(self, num_ent, num_rel, num_types, ent_etype,
-                 dim=32, n_heads=4, dropout=0.1):
+                 dim=32, n_heads=4, dropout=0.1, time_scale=1.0):
         super().__init__()
         self.dim = dim
         self.n_heads = n_heads
         self.head_dim = dim // n_heads
+        self.time_scale = time_scale
 
         # 实体/关系嵌入。注意：关系数量通常远小于实体数量且固定，
         # 新实体加入时【不需要】扩展关系表，只需扩展实体表(用类型初始化)。
         self.ent_emb = nn.Embedding(num_ent, dim)
         self.rel_emb = nn.Embedding(num_rel, dim)
         self.type_emb = nn.Embedding(num_types, dim)  # 仅用于初始化实体(尤其新实体)
+        # 可学习分数缩放：让 DistMult 分数具备合适的幅度，便于 BCE 区分正负样本
+        self.gamma = nn.Parameter(torch.ones(1))
 
-        # 用「实体类型嵌入」初始化实体嵌入：保证即便是从未训练过的新实体，
-        # 也有一个合理的、与其类型相关的初始表示。
-        nn.init.normal_(self.type_emb.weight, 0.0, 0.1)
+        # 嵌入初始化幅度：DistMult 分数 = Σ h·r·t。若嵌入过小(原 std=0.1)，
+        # 分数会聚集在 0 附近、sigmoid≈0.5，导致正负样本无法区分、推理排名接近随机
+        # （这正是之前所有候选得分都挤在 ±0.6、真实尾实体排不进前列的原因）。
+        # 把实体/关系嵌入初始化到 ~0.5 量级，使分数有 ±2 左右的区分度。
+        nn.init.normal_(self.rel_emb.weight, 0.0, 0.5)
+        nn.init.normal_(self.type_emb.weight, 0.0, 0.5)
         with torch.no_grad():
+            # 用「类型嵌入 + 少量随机噪声」初始化实体嵌入：既保留同类实体的合理共同先验，
+            # 又打破「同类实体初始完全相同」的对称性，使 TGAT 聚合后同类实体也能分化出各自
+            # 独特的表示，从而让 DistMult 打分具备区分度（否则同类型实体得分几乎一致、
+            # 推理排名接近随机）。
             for eid, ti in enumerate(ent_etype):
-                self.ent_emb.weight[eid] = self.type_emb.weight[ti]
+                self.ent_emb.weight[eid] = self.type_emb.weight[ti] + torch.randn(self.dim) * 0.1
 
         self.time_enc = TimeEncoder(dim)
 
@@ -346,7 +361,10 @@ class TemporalKGModel(nn.Module):
         而非一个独立于关系的第 4 维坐标。tau 与 r_ids 形状一致。
         """
         r = self.rel_emb(r_ids)                               # (N, dim) 基础关系嵌入
-        te = self.time_enc(tau)                               # (N, dim) 时间作为关系属性
+        # 时间作为关系属性：先把绝对时间 τ 按 time_scale 归一化到 O(1) 再编码，
+        # 避免 τ≈2000 时 freq*τ 过大导致正弦支路梯度爆炸、训练失稳（失稳会让模型把实体
+        # 嵌入压到极小来「补偿」，最终正负样本分数都挤在 0 附近、无法区分）。
+        te = self.time_enc(tau / self.time_scale)             # (N, dim) 时间作为关系属性
         return r + te                                         # (N, dim) 时间感知关系表示
 
     # -------------------- 编码器：时序图注意力 --------------------
@@ -379,7 +397,7 @@ class TemporalKGModel(nn.Module):
             nb_emb = self.ent_emb(nb_ids)                     # (N, dim)
             # 关系携带自己的时间属性：用 rel_repr(关系, 该边的绝对时间)
             r_emb = self.rel_repr(r_ids, torch.tensor([x[2] for x in hist], dtype=torch.float))
-            te = self.time_enc(tts)                           # (N, dim) 相对时间差(调权重)
+            te = self.time_enc(tts / self.time_scale)         # (N, dim) 相对时间差(调权重)
             f = nb_emb + r_emb + te                           # (N, dim) 邻居消息
             k = self.Wk(f).view(-1, self.n_heads, self.head_dim)
             v = self.Wv(f).view(-1, self.n_heads, self.head_dim)
@@ -400,7 +418,7 @@ class TemporalKGModel(nn.Module):
         所以同一三元组在不同时间的得分不同 —— 即「时间感知」。
         """
         r = self.rel_repr(r_ids, tau)                         # (B, dim) 时间感知关系表示
-        return torch.sum(h_repr * r * t_repr, dim=-1)         # (B,)
+        return self.gamma * torch.sum(h_repr * r * t_repr, dim=-1)  # (B,)
 
 
 # ====================================================================
@@ -556,9 +574,10 @@ def evaluate(model, test_quads, neigh, ent_by_type, rel_tail_types, sample_n=60)
             cands_t = torch.tensor(cands, dtype=torch.long)
             h_repr = model.entity_repr(torch.tensor([h]), torch.tensor([tau]), neigh)
             cands_repr = model.entity_repr(cands_t, torch.tensor([tau] * len(cands)), neigh)
-            # 关系携带时间属性：用 rel_repr(关系, 查询时间 τ)
-            r_rep = model.rel_repr(torch.tensor([r]), torch.tensor([tau])).expand(len(cands), -1)
-            scores = torch.sum(h_repr.expand(len(cands), -1) * r_rep * cands_repr, dim=-1)
+            # 关系携带时间属性：用 rel_repr(关系, 查询时间 τ)；统一走 model.score
+            r_ids = torch.tensor([r]).expand(len(cands))
+            taus = torch.tensor([tau] * len(cands))
+            scores = model.score(h_repr.expand(len(cands), -1), r_ids, cands_repr, taus)
 
             true_score = float(scores[cands.index(t)])
             # 过滤：去掉其它真实尾实体后再排名
@@ -584,9 +603,10 @@ def predict_tails(model, h, r, tau, neigh, ent_by_type, rel_tail_types, k=5):
         cands_t = torch.tensor(cands, dtype=torch.long)
         h_repr = model.entity_repr(torch.tensor([h]), torch.tensor([tau]), neigh)
         cands_repr = model.entity_repr(cands_t, torch.tensor([tau] * len(cands)), neigh)
-        # 关系携带时间属性：用 rel_repr(关系, 查询时间 τ)
-        r_rep = model.rel_repr(torch.tensor([r]), torch.tensor([tau])).expand(len(cands), -1)
-        scores = torch.sum(h_repr.expand(len(cands), -1) * r_rep * cands_repr, dim=-1)
+        # 关系携带时间属性：用 rel_repr(关系, 查询时间 τ)；统一走 model.score
+        r_ids = torch.tensor([r]).expand(len(cands))
+        taus = torch.tensor([tau] * len(cands))
+        scores = model.score(h_repr.expand(len(cands), -1), r_ids, cands_repr, taus)
         topk = torch.topk(scores, k)
         return [(int(cands[i]), float(scores[i])) for i in topk.indices.tolist()]
 
@@ -628,6 +648,11 @@ def main():
     # 实体类型索引(用于初始化实体嵌入)
     ent_etype = [ENTITY_TYPES.index(e.etype) for e in entities]
 
+    # 时间归一化尺度：把时间戳(年份/天数量级)缩放到 O(1)，避免 TimeEncoder 中 freq*τ
+    # 过大导致梯度爆炸、训练失稳。取全部四元组时间的最大绝对值。
+    all_times = [q.time for q in data["quads"]]
+    time_scale = float(max((abs(t) for t in all_times), default=1.0)) or 1.0
+
     # ---- 2) 构建模型 ----
     model = TemporalKGModel(
         num_ent=data["num_ent"],
@@ -636,6 +661,7 @@ def main():
         ent_etype=ent_etype,
         dim=args.dim,
         n_heads=4,
+        time_scale=time_scale,
     )
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
