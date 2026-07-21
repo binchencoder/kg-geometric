@@ -122,7 +122,7 @@ inference:
   # 故障诊断推理参数
   link_prediction:
     # 模型文件路径
-    model_path: /mnt/work/code/python_workspace/kg-geometric/trained_models/diagnosis/kg_fault_model.pth
+    model_path: /mnt/work/code/python_workspace/kg-geometric/trained_models/diagnosis/
     # 输入实例文本（多个症状以换行符 \n 分隔）
     instance: "发动机怠速不稳\n加速迟缓"
     # 返回 Top-K 故障诊断结果

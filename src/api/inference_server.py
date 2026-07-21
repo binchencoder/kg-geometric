@@ -65,6 +65,7 @@ src/api/inference_server.py
 
 4) TKGL 链接预测（JSON 请求体）
     POST /predict
+    # 单次推理
     {
       "head":     "Q648" | 123,   # 头实体：Q-ID/P-ID 字符串或整数 ID
       "relation": "P27"  | 7,     # 关系：P-ID 字符串或整数 ID
@@ -75,6 +76,21 @@ src/api/inference_server.py
     }
     -> {"query": {"head": "Q648", "relation": "P27", "time": 2008},
         "predictions": [{"tail": "Q42", "tail_id": 12, "score": 1.234}, ...]}
+
+    # 批量推理：queries 为查询列表，每个元素支持独立的 topk / temporal_bias / temporal_sigma
+    {
+      "queries": [
+        {"head": "Q648", "relation": "P27", "time": 2008},
+        {"head": "Q5",   "relation": "P19", "time": 2010, "topk": 10},
+        ...
+      ]
+    }
+    -> {"results": [
+          {"query": {...}, "predictions": [...]},
+          {"query": {...}, "predictions": [...]},
+          ...
+        ]}
+    # 单条失败时返回 {"error": "...", "index": <下标>}，不影响其余查询
 
 5) TKGL 评测（JSON 请求体）
     POST /evaluate
@@ -317,8 +333,11 @@ class InferenceService:
             self._tkgl = None
 
     # ---------------- 推理 ----------------
-    def diagnose(self, symptoms: str, model_name: "str | None" = None,
-                 top_k: "int | None" = None) -> dict:
+    def diagnose(
+            self, symptoms: str,
+            model_name: "str | None" = None,
+            top_k: "int | None" = None
+    ) -> dict:
         """执行故障诊断，返回结构化 JSON dict。"""
         if not self._diag_cache:
             raise RuntimeError("未加载任何诊断模型，请检查 --diagnosis-models-dir")
@@ -437,6 +456,48 @@ class InferenceService:
 
     def predict_link(
             self,
+            head=None,
+            relation=None,
+            time=None,
+            queries=None,
+            topk: int = 5,
+            temporal_bias: float = 50.0,
+            temporal_sigma: float = 8.0,
+    ) -> dict:
+        """TKGL 链接预测：给定 (头, 关系, 时间) 预测 Top-K 尾实体。
+
+        支持两种调用方式：
+          * 单次：传入 head / relation / time（标量）
+          * 批量：传入 queries（元素为 {head, relation, time, ...} 的列表）
+        批量模式返回 {"results": [...]}；单次模式返回单条结果 dict。
+        """
+        # 批量模式：queries 为查询列表
+        if queries is not None:
+            if not isinstance(queries, list) or not queries:
+                raise ValueError("queries 必须是非空列表")
+
+            results = []
+            for i, q in enumerate(queries):
+                try:
+                    results.append(self._predict_link_one(
+                        q.get("head"), q.get("relation"), q.get("time"),
+                        topk=int(q.get("topk", topk)),
+                        temporal_bias=float(q.get("temporal_bias", temporal_bias)),
+                        temporal_sigma=float(q.get("temporal_sigma", temporal_sigma)),
+                    ))
+                except (ValueError, RuntimeError) as e:  # noqa: BLE001
+                    results.append({"error": str(e), "index": i})
+            return {"results": results}
+
+        # 单次模式
+        return self._predict_link_one(
+            head, relation, time,
+            topk=topk,
+            temporal_bias=temporal_bias, temporal_sigma=temporal_sigma
+        )
+
+    def _predict_link_one(
+            self,
             head,
             relation,
             time,
@@ -444,7 +505,7 @@ class InferenceService:
             temporal_bias: float = 50.0,
             temporal_sigma: float = 8.0,
     ) -> dict:
-        """TKGL 链接预测：给定 (头, 关系, 时间) 预测 Top-K 尾实体。"""
+        """TKGL 链接预测单条推理。"""
         if self._tkgl is None:
             raise RuntimeError("未加载 TKGL 模型，请检查 --model-path")
 
@@ -520,13 +581,74 @@ class _Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0) or 0)
         if length <= 0:
             return {}
+
         raw = self.rfile.read(length)
         if not raw:
             return {}
+
         return json.loads(raw.decode("utf-8"))
 
     def log_message(self, fmt, *args):  # 静默默认访问日志，避免刷屏
         pass
+
+    # ---------------- 各路由处理 ----------------
+    def _do_diagnosis(self, payload: dict) -> None:
+        """POST /diagnosis：故障诊断推理。"""
+        symptoms = payload.get("symptoms", payload.get("instance"))
+        if not symptoms or not str(symptoms).strip():
+            self._send_json(
+                {"error": "缺少必填字段: symptoms（或 instance）"},
+                status=400)
+            return
+        top_k = payload.get("top_k")
+        model = payload.get("model")
+        result = _Handler.service.diagnose(
+            str(symptoms), model_name=model, top_k=top_k)
+        self._send_json(result)
+
+    def _do_trend(self, payload: dict) -> None:
+        """POST /trend：时序趋势预测推理。"""
+        slice_idx = payload.get("slice_idx")
+        result = _Handler.service.predict_trend(
+            slice_idx=int(slice_idx) if slice_idx is not None else None)
+        self._send_json(result)
+
+    def _do_predict(self, payload: dict) -> None:
+        """POST /predict：TKGL 链接预测（单次或批量）。"""
+        queries = payload.get("queries")
+        if queries is not None:
+            # 批量推理：queries 为查询列表
+            try:
+                result = _Handler.service.predict_link(queries=queries)
+            except (ValueError, RuntimeError) as e:  # noqa: BLE001
+                self._send_json({"error": str(e)}, status=400)
+                return
+            self._send_json(result)
+            return
+
+        # 单次推理
+        head = payload.get("head")
+        relation = payload.get("relation")
+        time = payload.get("time")
+        if head is None or relation is None or time is None:
+            self._send_json(
+                {"error": "缺少必填字段: head / relation / time（或 queries）"},
+                status=400)
+            return
+        topk = int(payload.get("topk", 5))
+        temporal_bias = float(payload.get("temporal_bias", 50.0))
+        temporal_sigma = float(payload.get("temporal_sigma", 8.0))
+        result = _Handler.service.predict_link(
+            head, relation, time, topk=topk,
+            temporal_bias=temporal_bias, temporal_sigma=temporal_sigma)
+        self._send_json(result)
+
+    def _do_evaluate(self, payload: dict) -> None:
+        """POST /evaluate：TKGL 测试集过滤式 MRR / Hits@k 评测。"""
+        num_eval = int(payload.get("num_eval", 2000))
+        k_neg = int(payload.get("k_neg", 500))
+        result = _Handler.service.evaluate_link(num_eval, k_neg)
+        self._send_json(result)
 
     # ---------------- 路由 ----------------
     def do_GET(self):
@@ -551,49 +673,19 @@ class _Handler(BaseHTTPRequestHandler):
 
         try:
             if path in ("/diagnosis", "/diagnosis/"):
-                symptoms = payload.get("symptoms", payload.get("instance"))
-                if not symptoms or not str(symptoms).strip():
-                    self._send_json(
-                        {"error": "缺少必填字段: symptoms（或 instance）"},
-                        status=400)
-                    return
-                top_k = payload.get("top_k")
-                model = payload.get("model")
-                result = _Handler.service.diagnose(
-                    str(symptoms), model_name=model, top_k=top_k)
-                self._send_json(result)
+                self._do_diagnosis(payload)
                 return
 
             if path in ("/trend", "/trend/"):
-                slice_idx = payload.get("slice_idx")
-                result = _Handler.service.predict_trend(
-                    slice_idx=int(slice_idx) if slice_idx is not None else None)
-                self._send_json(result)
+                self._do_trend(payload)
                 return
 
             if path in ("/predict", "/predict/"):
-                head = payload.get("head")
-                relation = payload.get("relation")
-                time = payload.get("time")
-                if head is None or relation is None or time is None:
-                    self._send_json(
-                        {"error": "缺少必填字段: head / relation / time"},
-                        status=400)
-                    return
-                topk = int(payload.get("topk", 5))
-                temporal_bias = float(payload.get("temporal_bias", 50.0))
-                temporal_sigma = float(payload.get("temporal_sigma", 8.0))
-                result = _Handler.service.predict_link(
-                    head, relation, time, topk=topk,
-                    temporal_bias=temporal_bias, temporal_sigma=temporal_sigma)
-                self._send_json(result)
+                self._do_predict(payload)
                 return
 
             if path in ("/evaluate", "/evaluate/"):
-                num_eval = int(payload.get("num_eval", 2000))
-                k_neg = int(payload.get("k_neg", 500))
-                result = _Handler.service.evaluate_link(num_eval, k_neg)
-                self._send_json(result)
+                self._do_evaluate(payload)
                 return
 
             self._send_json({"error": f"未知路径: {path}"}, status=404)
