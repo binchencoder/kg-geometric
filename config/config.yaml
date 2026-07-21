@@ -55,14 +55,7 @@ relation_mapping:
   system: "属于系统"
   category: "属于类别"
 
-# -------------------- 训练脚本全局参数 --------------------
-training:
-  # 训练模式: both / diagnosis / prediction
-  mode: both
-  # 随机种子
-  seed: 42
-  # 训练设备: auto / cpu / cuda:0
-  device: auto
+
 
 # -------------------- 故障诊断训练参数（R-GCN + 三元组知识图谱） --------------------
 diagnosis:
@@ -109,12 +102,24 @@ health_mapping:
   - 严重过热
   - 过载故障
 
+# -------------------- 训练脚本全局参数 --------------------
+training:
+  # 训练模式: both / diagnosis / prediction
+  mode: both
+  # 随机种子
+  seed: 42
+  # 训练设备: auto / cpu / cuda:0
+  device: auto
+
 # -------------------- 推理引擎参数（predict.py） --------------------
 inference:
-  # 推理设备: cpu / cuda / cuda:0 等
-  device: cpu
+  # HTTP 服务绑定地址与端口
+  host: 127.0.0.1
+  port: 8000
+  # 推理设备: auto / cpu / cuda / cuda:0 等（auto 自动选择 cuda 或 cpu）
+  device: auto
 
-  # 链接预测推理参数
+  # 故障诊断推理参数
   link_prediction:
     # 模型文件路径
     model_path: /mnt/work/code/python_workspace/kg-geometric/trained_models/diagnosis/kg_fault_model.pth
@@ -123,8 +128,12 @@ inference:
     # 返回 Top-K 故障诊断结果
     top_k: 3
 
-  # 趋势预测推理参数
+  # 故障预测推理参数
   trend_prediction:
     # 模型文件路径
     model_path: /mnt/work/code/python_workspace/kg-geometric/trained_models/trend
 
+  # 时序链接预测模型推理参数
+  tkgl_prediction:
+    # 模型文件路径
+    model_path: /mnt/work/code/python_workspace/kg-geometric/trained_models/tkgl/tkgl_smallpedia_model.pt

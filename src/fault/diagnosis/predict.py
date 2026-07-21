@@ -722,6 +722,10 @@ def main() -> None:
     parser = _build_arg_parser(cfg)
     args = parser.parse_args()
 
+    # ---- 解析推理设备: auto -> cuda(若可用) / cpu ----
+    if args.device == "auto":
+        args.device = "cuda" if torch.cuda.is_available() else "cpu"
+
     # ---- 注册模型处理器 ----
     # symptom_relation 不再通过参数传递，由处理器从 config.yaml 的
     # relation_mapping.symptoms 读取。

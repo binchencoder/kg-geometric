@@ -17,16 +17,19 @@
 
 用法:
     # 故障诊断 (默认使用 ES 中的 "车辆故障诊断" 图谱)
-    python train.py --mode diagnosis
-    python train.py --mode diagnosis --epochs 500 --hidden-dim 128
+    python -m src.fault.train --mode diagnosis
+    python -m src.fault.train --mode diagnosis --epochs 500 --hidden-dim 128
 
     # 故障预测 (使用 ETTh1/ETTh2 等变压器时序数据)
-    python train.py --mode prediction --csv-path /path/to/ETTh1.csv
-    python train.py --mode prediction --hold-out 10 --epochs 200
+    python -m src.fault.train --mode prediction --csv-path /path/to/ETTh1.csv
+    python -m src.fault.train --mode prediction --hold-out 10 --epochs 200
 
     # 一键运行两个流程
-    python train.py
-    python train.py --save-model ./models/ --query "加速迟缓"
+    python -m src.fault.train
+    python -m src.fault.train --save-model ./models/ --query "加速迟缓"
+
+    # 也可作为脚本直接运行（已自动注入项目根到 sys.path）：
+    python src/fault/train.py --mode diagnosis
 """
 
 from __future__ import annotations
@@ -34,6 +37,7 @@ from __future__ import annotations
 import argparse
 import os
 import random
+import sys
 
 import numpy as np
 import torch
@@ -41,6 +45,13 @@ import torch.nn.functional as F
 from sklearn.model_selection import train_test_split
 from torch_geometric.data import HeteroData
 from torch_geometric.nn import RGCNConv, Linear
+
+# 项目根目录加入 sys.path，使以脚本方式运行本文件时 `import src...` 等
+# 包内绝对导入可解析（`python src/fault/train.py` 时 cwd 不自动入 path，
+# 故显式注入；`python -m src.fault.train` 时 cwd 已在 path，此步无害）。
+_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
 
 from src.core.config import (
     DiagnosisTrainingConfig,
@@ -524,15 +535,15 @@ def _parse_args(
         epilog="""\
 示例:
   # 默认同时运行两个流程（所有参数来自 config/config.yaml）
-  python train.py
+  python -m src.fault.train
 
   # 仅故障诊断（命令行可覆盖 YAML 默认值）
-  python train.py --mode diagnosis --diag-epochs 500 --diag-hidden-dim 128
-  python train.py --mode diagnosis --query "加速迟缓" --device cuda
+  python -m src.fault.train --mode diagnosis --diag-epochs 500 --diag-hidden-dim 128
+  python -m src.fault.train --mode diagnosis --query "加速迟缓" --device cuda
 
   # 仅故障预测（变压器时序数据）
-  python train.py --mode prediction --csv-path /path/to/ETTh1.csv
-  python train.py --mode prediction --pred-hold-out 10 --pred-epochs 200 --pred-lr 1e-3
+  python -m src.fault.train --mode prediction --csv-path /path/to/ETTh1.csv
+  python -m src.fault.train --mode prediction --pred-hold-out 10 --pred-epochs 200 --pred-lr 1e-3
 """,
     )
 

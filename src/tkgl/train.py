@@ -32,7 +32,7 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from src.model.tkgl import TemporalKGModel, save_checkpoint  # noqa: E402
-from src.dataset.tkgl_dataset import load_tkgl_smallpedia, iter_train_batches  # noqa: E402
+from src.dataset.tkgl_dataset import load_tkgl_data, iter_train_batches  # noqa: E402
 
 # 过滤式评测（训练期 val 监控用）；predict 模块本身只依赖 temporal_model，
 # 不会产生循环依赖。
@@ -42,7 +42,14 @@ from src.tkgl.predict import evaluate_filtered, _build_relation_endpoints, _get_
 # ====================================================================
 # 1. 同关系困难负采样
 # ====================================================================
-def _sample_typed_negatives(model, h, r, t, ts, n_neg):
+def _sample_typed_negatives(
+        model,
+        h,
+        r,
+        t,
+        ts,
+        n_neg
+):
     """同关系困难负采样：负尾从关系 r 的合法尾集合采样（排除真实尾），
     负头从关系 r 的合法头集合采样（排除真实头）。合法集合不足 n_neg 个时，
     用均匀随机负样本补足（不会死循环）。返回 (neg_t, neg_h) 均为 (B,n_neg) int64。
@@ -202,7 +209,11 @@ def run_training(args, device):
     print(f"📂 加载数据集: {args.data_dir}")
     # build_train_arrays=False：跳过约 150 万条训练/静态四元组的整体驻留，
     # 训练边改为 iter_train_batches 流式分批产出（验证/测试四元组仍需驻留，体积小）。
-    data = load_tkgl_smallpedia(args.data_dir, build_train_arrays=False)
+    data = load_tkgl_data(
+        args.data_dir,
+        args.dynamic_edge_file, args.static_edge_file,
+        build_train_arrays=False
+    )
     print("=" * 70)
     print("【数据集概览】")
     print(f"  实体总数={data['num_ent']}, 关系总数={data['num_rel']}")
@@ -229,6 +240,7 @@ def run_training(args, device):
     def make_batch_iter(epoch):
         return iter_train_batches(
             args.data_dir, data["entity2id"], data["relation2id"],
+            args.dynamic_edge_file, args.static_edge_file,
             batch_size=args.batch, buffer=args.buffer, seed=epoch, shuffle=True)
 
     train_model(model, make_batch_iter, optimizer, device,
@@ -258,6 +270,12 @@ def _build_arg_parser():
     parser = argparse.ArgumentParser(description="TKGL-Smallpedia 时序知识图谱链接预测（训练）")
     parser.add_argument("--data-dir", type=str,
                         default=os.path.join(_ROOT, "data", "tkgl-smallpedia"))
+    parser.add_argument("--dynamic-edge-file", type=str,
+                        default="tkgl-smallpedia_edgelist.csv",
+                        help="时序（动态）边文件名（相对 data-dir）")
+    parser.add_argument("--static-edge-file", type=str,
+                        default="tkgl-smallpedia_static_edgelist.csv",
+                        help="静态边文件名（相对 data-dir）")
     parser.add_argument("--model-path", type=str,
                         default=os.path.join(_ROOT, "trained_models", "tkgl_smallpedia_model.pt"))
     parser.add_argument("--epochs", type=int, default=30)

@@ -26,7 +26,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ESKGReader")
 
-
 # -------------------- 配置文件路径 --------------------
 _PROJECT_ROOT = os.path.abspath(
     os.path.join(os.path.dirname(__file__), os.pardir, os.pardir)
@@ -105,13 +104,13 @@ def _require_section(root: Dict[str, Any], section: str, path: str) -> Dict[str,
 
 
 def _validate_and_coerce(
-    data: Dict[str, Any],
-    section: str,
-    required: frozenset,
-    int_fields: tuple,
-    bool_fields: tuple,
-    str_fields: tuple,
-    path: str,
+        data: Dict[str, Any],
+        section: str,
+        required: frozenset,
+        int_fields: tuple,
+        bool_fields: tuple,
+        str_fields: tuple,
+        path: str,
 ) -> Dict[str, Any]:
     """通用的字段存在性检查 + 类型校正。"""
     missing = [k for k in required if k not in data or data[k] is None]
@@ -206,14 +205,14 @@ _PREDICTION_REQUIRED: frozenset = frozenset(
 
 
 def _validate_section_opt(
-    data: Dict[str, Any],
-    section: str,
-    required: frozenset,
-    int_fields: tuple,
-    float_fields: tuple,
-    str_fields: tuple,
-    opt_str_fields: tuple,
-    path: str,
+        data: Dict[str, Any],
+        section: str,
+        required: frozenset,
+        int_fields: tuple,
+        float_fields: tuple,
+        str_fields: tuple,
+        opt_str_fields: tuple,
+        path: str,
 ) -> Dict[str, Any]:
     """带可选字段的字段存在性检查 + 类型校正。"""
     missing = [k for k in required if k not in data or data[k] is None]
@@ -367,7 +366,7 @@ class PredictionTrainingConfig:
 
 
 def load_training_configs(
-    path: str = DEFAULT_CONFIG_PATH,
+        path: str = DEFAULT_CONFIG_PATH,
 ) -> tuple[TrainingConfig, DiagnosisTrainingConfig, PredictionTrainingConfig]:
     """一次性加载全部训练配置。"""
     return (
@@ -378,7 +377,7 @@ def load_training_configs(
 
 
 def _resolve_health_mapping_config(
-    path: str = DEFAULT_CONFIG_PATH,
+        path: str = DEFAULT_CONFIG_PATH,
 ) -> Dict[int, str]:
     """从 YAML 的 `health_mapping` 段读取健康状态标签映射。
 
@@ -451,14 +450,14 @@ class HealthMappingConfig:
 
 
 def load_health_mapping(
-    path: str = DEFAULT_CONFIG_PATH,
+        path: str = DEFAULT_CONFIG_PATH,
 ) -> Dict[int, str]:
     """便捷函数：直接返回 {标签 id: 中文描述} 的映射。"""
     return HealthMappingConfig.from_yaml(path).mapping
 
 
 def _resolve_inference_config(
-    path: str = DEFAULT_CONFIG_PATH,
+        path: str = DEFAULT_CONFIG_PATH,
 ) -> Dict[str, Any]:
     """从 YAML 的 `inference:` 段读取推理引擎参数（predict.py）。
 
@@ -475,6 +474,11 @@ def _resolve_inference_config(
     """
     root = _load_yaml_config(path)
     section_data = _require_section(root, "inference", path)
+
+    host = str(section_data.get("host", "0.0.0.0"))
+    port = int(section_data.get("port", 8000))
+    if not isinstance(host, str) or not host.strip():
+        host = "0.0.0.0"
 
     device = section_data.get("device", "cpu")
     if not isinstance(device, str) or not device.strip():
@@ -508,7 +512,16 @@ def _resolve_inference_config(
     if not isinstance(trend_model_path, str):
         trend_model_path = str(trend_model_path) if trend_model_path is not None else ""
 
+    tkp = section_data.get("tkgl_prediction") or {}
+    if not isinstance(tkp, dict):
+        tkp = {}
+    tkgl_model_path = tkp.get("model_path", "")
+    if not isinstance(tkgl_model_path, str):
+        tkgl_model_path = str(tkgl_model_path) if tkgl_model_path is not None else ""
+
     merged: Dict[str, Any] = {
+        "host": host.strip(),
+        "port": port,
         "device": device.strip(),
         "models_dir": models_dir.strip(),
         "link_prediction": {
@@ -518,6 +531,9 @@ def _resolve_inference_config(
         },
         "trend_prediction": {
             "model_path": trend_model_path.strip(),
+        },
+        "tkgl_prediction": {
+            "model_path": tkgl_model_path.strip(),
         },
     }
     logger.info(
@@ -543,12 +559,20 @@ class TrendPredictionConfig:
 
 
 @dataclass(frozen=True)
+class TKGLPredictionConfig:
+    """时序链接预测推理子配置。"""
+    model_path: str
+
+
+@dataclass(frozen=True)
 class InferenceConfig:
     """推理引擎配置（predict.py 的默认参数，从 ``config/config.yaml`` 加载）。"""
+    host: str
+    port: int
     device: str
-    models_dir: str
     link_prediction: LinkPredictionConfig
     trend_prediction: TrendPredictionConfig
+    tkgl_prediction: TKGLPredictionConfig
 
     @property
     def instance(self) -> str:
@@ -568,8 +592,9 @@ class InferenceConfig:
     def from_yaml(cls, path: str) -> "InferenceConfig":
         m = _resolve_inference_config(path)
         return cls(
+            host=str(m["host"]),
+            port=int(m["port"]),
             device=str(m["device"]),
-            models_dir=str(m["models_dir"]),
             link_prediction=LinkPredictionConfig(
                 model_path=str(m["link_prediction"]["model_path"]),
                 instance=str(m["link_prediction"]["instance"]),
@@ -578,11 +603,14 @@ class InferenceConfig:
             trend_prediction=TrendPredictionConfig(
                 model_path=str(m["trend_prediction"]["model_path"]),
             ),
+            tkgl_prediction=TKGLPredictionConfig(
+                model_path=str(m["tkgl_prediction"]["model_path"]),
+            ),
         )
 
 
 def load_inference_config(
-    path: str = DEFAULT_CONFIG_PATH,
+        path: str = DEFAULT_CONFIG_PATH,
 ) -> InferenceConfig:
     """便捷函数：加载 InferenceConfig。"""
     return InferenceConfig.from_yaml(path)
@@ -715,20 +743,20 @@ class KnowledgeGraphSchema:
         )
 
     def override(
-        self,
-        graph_id: Optional[str] = None,
-        ontology_id: Optional[str] = None,
-        batch_size: Optional[int] = None,
-        entity_index: Optional[str] = None,
-        relation_index: Optional[str] = None,
-        relation_type_index: Optional[str] = None,
-        entity_id_field: Optional[str] = None,
-        entity_name_field: Optional[str] = None,
-        head_id_field: Optional[str] = None,
-        tail_id_field: Optional[str] = None,
-        relation_field: Optional[str] = None,
-        relation_type_id_field: Optional[str] = None,
-        relation_type_name_field: Optional[str] = None,
+            self,
+            graph_id: Optional[str] = None,
+            ontology_id: Optional[str] = None,
+            batch_size: Optional[int] = None,
+            entity_index: Optional[str] = None,
+            relation_index: Optional[str] = None,
+            relation_type_index: Optional[str] = None,
+            entity_id_field: Optional[str] = None,
+            entity_name_field: Optional[str] = None,
+            head_id_field: Optional[str] = None,
+            tail_id_field: Optional[str] = None,
+            relation_field: Optional[str] = None,
+            relation_type_id_field: Optional[str] = None,
+            relation_type_name_field: Optional[str] = None,
     ) -> "KnowledgeGraphSchema":
         """返回一个新 schema，部分字段被覆盖；为 None 的字段保持原值。"""
         return KnowledgeGraphSchema(
@@ -770,7 +798,7 @@ def load_kg_config(path: str = DEFAULT_CONFIG_PATH) -> KnowledgeGraphSchema:
 
 # -------------------- 故障诊断关系映射 --------------------
 def _resolve_relation_mapping_config(
-    path: str = DEFAULT_CONFIG_PATH,
+        path: str = DEFAULT_CONFIG_PATH,
 ) -> Dict[str, str]:
     """从 YAML 的 `relation_mapping:` 段读取语义角色 → 关系名映射。
 
@@ -849,7 +877,7 @@ class RelationMappingConfig:
 
 
 def load_relation_mapping(
-    path: str = DEFAULT_CONFIG_PATH,
+        path: str = DEFAULT_CONFIG_PATH,
 ) -> Dict[str, str]:
     """便捷函数：直接返回 {语义角色: 关系名} 的映射。"""
     return RelationMappingConfig.from_yaml(path).mapping

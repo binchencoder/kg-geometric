@@ -17,10 +17,10 @@ TKGL-Smallpedia 时序知识图谱链接预测 —— 推理与评测
 模型与 checkpoint 序列化见 src/model/tkgl.py；数据集加载见 src/dataset/tkgl_dataset.py。
 """
 
+import argparse
+import math
 import os
 import sys
-import math
-import argparse
 
 import numpy as np
 import torch
@@ -31,19 +31,28 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from src.model.tkgl import load_checkpoint, TemporalKGModel  # noqa: E402
+from src.core.config import TKGLPredictionConfig, InferenceConfig
+from src.model.tkgl import load_checkpoint  # noqa: E402
 
 
 # ====================================================================
 # 1. 过滤式 MRR 评测（采样负样本）
 # ====================================================================
-def evaluate_filtered(model, quads, true_tails, num_eval=2000, k_neg=500,
-                      seed=0, device="cpu"):
+def evaluate_filtered(
+        model,
+        quads,
+        true_tails,
+        num_eval=2000,
+        k_neg=500,
+        seed=0,
+        device="cpu"
+):
     """对每个查询，真实尾 + k_neg 个均匀负样本一起打分，过滤掉同 (头,关系,时间)
     的其它真实尾后排名，计算 MRR / Hits@1/3/10。"""
     model.eval()
     if quads.shape[0] == 0:
         return 0.0, 0.0, 0.0, 0.0
+
     rng = np.random.default_rng(seed)
     idx = rng.choice(quads.shape[0], size=min(num_eval, quads.shape[0]), replace=False)
     mrr = h1 = h3 = h10 = 0.0
@@ -95,8 +104,8 @@ def _build_relation_endpoints(model):
     hr_tails = defaultdict(set)
     for e, (nb, rel, tt) in model.neigh.items():
         for nbi, ri in zip(nb.tolist(), rel.tolist()):
-            rel_tails[ri].add(nbi)      # nbi 是关系 ri 的尾
-            rel_heads[ri].add(e)        # e 是关系 ri 的头
+            rel_tails[ri].add(nbi)  # nbi 是关系 ri 的尾
+            rel_heads[ri].add(e)  # e 是关系 ri 的头
             hr_tails[(e, ri)].add(nbi)  # (e, ri) 这个头-关系对的历史尾
     model._rel_tails = rel_tails
     model._rel_heads = rel_heads
@@ -154,7 +163,9 @@ def predict_tails(model, h, r, ts, true_t=None, k=5, k_neg=2000, seed=0, device=
     头实体自身也不作为尾返回。
     """
     model.eval()
-    h = int(h); r = int(r); ts = float(ts)
+    h = int(h);
+    r = int(r);
+    ts = float(ts)
     filt = model._true_tails.get((h, r, int(ts)), set()) if hasattr(model, "_true_tails") else set()
     # 手动推理（true_t=None）不排除真实尾，便于用户核对真实尾的排名；
     # 评测模式（true_t 给定）则过滤掉同 (头,关系,时间) 的其它真实尾（过滤式设定），
@@ -171,22 +182,22 @@ def predict_tails(model, h, r, ts, true_t=None, k=5, k_neg=2000, seed=0, device=
     if len(cand_set) == 0:
         cand_set = _get_relation_tail_set(model, r)
     if len(cand_set) == 0:
-        cand_set = set(range(model.num_ent))   # 兜底：全实体
+        cand_set = set(range(model.num_ent))  # 兜底：全实体
     cand_list = sorted(cand_set - exclude)
 
     chunk = 10000
-    scored = []                         # (score, tail_id)
+    scored = []  # (score, tail_id)
     # 时间邻近性偏置：与查询 τ 越接近的历史尾，偏置越大（缓解「只记高频旧尾」）
     rec = _temporal_recency(model, h, r, ts, sigma=temporal_sigma) if temporal_bias else {}
     with torch.no_grad():
         h_t = torch.tensor([h], dtype=torch.long, device=device)
         ts_t = torch.tensor([ts], device=device)
-        h_repr = model.entity_repr(h_t, ts_t)               # (1, dim)
+        h_repr = model.entity_repr(h_t, ts_t)  # (1, dim)
         r_t = torch.tensor([r], dtype=torch.long, device=device)
         for s in range(0, len(cand_list), chunk):
             e = torch.tensor(cand_list[s:s + chunk], dtype=torch.long, device=device)
             e_ts = torch.full((e.shape[0],), ts, device=device)
-            e_repr = model.entity_repr(e, e_ts)             # (chunk, dim)
+            e_repr = model.entity_repr(e, e_ts)  # (chunk, dim)
             sc = model.score(h_repr.expand(e.shape[0], -1),
                              r_t.expand(e.shape[0]), e_repr, e_ts)
             sc_np = sc.detach().cpu().numpy()
@@ -212,11 +223,11 @@ def _resolve_id(token, name2id, id2name):
     token = (token or "").strip()
     if token == "":
         return None
-    if token in name2id:                 # 名称形式（Q-ID / P-ID）
+    if token in name2id:  # 名称形式（Q-ID / P-ID）
         return int(name2id[token])
     try:
         i = int(token)
-        if i in id2name:                 # 整数 ID 形式
+        if i in id2name:  # 整数 ID 形式
             return i
     except ValueError:
         pass
@@ -251,10 +262,10 @@ def run_interactive_infer(model, data, device, topk, k_neg,
             print("  ⚠️ 时间必须是整数年份（如 2008）\n")
             continue
         if h is None:
-            print(f"  ⚠️ 未知头实体: {h_in}（可用 ID 范围 0~{model.num_ent-1}）\n")
+            print(f"  ⚠️ 未知头实体: {h_in}（可用 ID 范围 0~{model.num_ent - 1}）\n")
             continue
         if r is None:
-            print(f"  ⚠️ 未知关系: {r_in}（可用 ID 范围 0~{model.num_rel-1}）\n")
+            print(f"  ⚠️ 未知关系: {r_in}（可用 ID 范围 0~{model.num_rel - 1}）\n")
             continue
         top = predict_tails(model, h, r, ts, true_t=None, k=topk,
                             k_neg=max(k_neg, 2000), device=device,
@@ -273,9 +284,12 @@ def run_inference(args, device):
     predict_tails / evaluate_filtered 等函数。
     """
     ckpt_path = args.model_path
-    print(f"ckpt_path: {ckpt_path}")
+    if not ckpt_path:
+        raise SystemExit(
+            "❌ 未指定模型路径。请通过 --model-path 指定，或在 config/config.yaml 的 "
+            "inference.tkgl_prediction.model_path 中配置。")
     if not os.path.exists(ckpt_path):
-        raise SystemExit(f"❌ 未找到模型文件: {ckpt_path}\n   请先以 --mode train 训练。")
+        raise SystemExit(f"❌ 未找到模型文件: {ckpt_path}")
     print(f"📥 加载已训练模型: {ckpt_path}")
     model, data = load_checkpoint(ckpt_path, device=device)
     id2ent = data["id2entity"]
@@ -336,10 +350,32 @@ def run_inference(args, device):
         print(f"    => 真实尾是否在 Top-{args.topk}: {hit}")
 
 
+# 默认TKGL模型推理配置
+def _default_tkgl_prediction() -> TKGLPredictionConfig:
+    try:
+        from src.core.config import InferenceConfig
+        return InferenceConfig.default().tkgl_prediction
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+# 默认推理配置（来自 config.yaml 的 inference）
+def _default_inference() -> InferenceConfig:
+    try:
+        from src.core.config import InferenceConfig
+        return InferenceConfig.default()
+    except Exception:  # noqa: BLE001
+        return "auto"
+
+
 def _build_arg_parser():
     parser = argparse.ArgumentParser(description="TKGL-Smallpedia 时序知识图谱链接预测（推理）")
-    parser.add_argument("--model-path", type=str, required=True,
-                        help="已训练模型 .pt 路径")
+    parser.add_argument("--model-path", type=str,
+                        default=_default_tkgl_prediction().model_path,
+                        help="已训练模型 .pt 路径，默认来自 config.yaml")
+    parser.add_argument("--device", type=str, default=_default_inference().device,
+                        help="推理设备 auto/cpu/cuda，默认来自 config.yaml")
+
     parser.add_argument("--num-eval", type=int, default=2000, help="评测查询数")
     parser.add_argument("--k-neg", type=int, default=500, help="评测每个查询的负样本数")
     parser.add_argument("--topk", type=int, default=5)
@@ -353,14 +389,14 @@ def _build_arg_parser():
                              "历史尾在更久之后查询时仍能保留偏置；越小越「喜新厌旧」。")
     parser.add_argument("--interactive", action="store_true",
                         help="交互式推理：逐条手动输入 头实体/关系/时间 进行预测")
+
     parser.add_argument("--head", type=str, default=None,
                         help="手动推理的头实体（Q-ID 或整数ID），配合 --relation/--time 使用")
     parser.add_argument("--relation", type=str, default=None,
                         help="手动推理的关系（P-ID 或整数ID）")
     parser.add_argument("--time", type=int, default=None,
                         help="手动推理的时间（年份整数，如 2008）")
-    parser.add_argument("--device", type=str, default="auto",
-                        help="推理设备 auto/cpu/cuda")
+
     return parser
 
 

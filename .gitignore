@@ -227,5 +227,6 @@ build
 
 
 # Models
-/trained_models/
+trained_models
+/trained_models*/
 */trained_models/
