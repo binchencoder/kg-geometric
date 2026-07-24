@@ -24,16 +24,16 @@ import numpy as np
 import torch
 
 from src.model.rgcn import FaultRGCN
-from src.model.gcn import FaultGCN
+from src.model.gcn import GCNModel
 from src.model.training import split_masks, train_rgcn, train, evaluate
 from src.dataset.triple_dataset import KGTripleDataset
 from src.pipeline.inference import (
     infer_from_text,
     format_result,
     format_result_compact,
-    DiagnosisResult,
+    SLPResult,
 )
-from src.pipeline.diagnosis import topk_fault_diagnosis, print_topk_diagnosis
+from src.pipeline.slp import topk_static_link_prediction, print_topk_static_link_prediction
 from src.core.config import logger, ESConfig
 
 # 固定随机种子
@@ -44,7 +44,7 @@ torch.manual_seed(SEED)
 
 # 保持 __all__ 向后兼容 predict.py
 __all__ = [
-    "FaultGCN",
+    "GCNModel",
     "FaultRGCN",
     "KGTripleDataset",
     "split_masks",
@@ -54,8 +54,8 @@ __all__ = [
     "infer_from_text",
     "format_result",
     "format_result_compact",
-    "topk_fault_diagnosis",
-    "print_topk_diagnosis",
+    "topk_static_link_prediction",
+    "print_topk_static_link_prediction",
 ]
 
 
@@ -176,10 +176,11 @@ def run_inference(
         model: FaultRGCN,
         dataset: KGTripleDataset,
         query: str,
-        top_k_symptoms: int = 5,
-        top_k_faults: int = 3,
-) -> DiagnosisResult:
-    """执行四阶段故障诊断推理。
+        top_k: int = 5,
+        relation_mapping: "Optional[Dict[str, str]]" = None,
+        device: str = "cpu",
+) -> SLPResult:
+    """执行静态链接预测推理。
 
     Parameters
     ----------
@@ -188,25 +189,27 @@ def run_inference(
     dataset : KGTripleDataset
         知识图谱数据集。
     query : str
-        用户输入的症状描述文本。
-    top_k_symptoms : int
-        语义匹配的候选症状数。
-    top_k_faults : int
-        故障定位的候选故障数。
+        查询文本。
+    top_k : int
+        语义匹配的候选头实体数。
+    relation_mapping : Optional[Dict[str, str]]
+        输出字段名 → 关系名的映射；为 None 时使用数据集默认映射。
+    device : str
+        推理设备。
 
     Returns
     -------
-    DiagnosisResult
-        完整诊断结果。
+    SLPResult
+        完整推理结果。
     """
     model.eval()
     return infer_from_text(
         model=model,
         dataset=dataset,
         query_text=query,
-        top_k_symptoms=top_k_symptoms,
-        top_k_faults=top_k_faults,
-        symptom_relation="表现为",
+        top_k=top_k,
+        relation_mapping=relation_mapping,
+        device=device,
     )
 
 
@@ -226,7 +229,7 @@ def main() -> None:
     parser.add_argument("--query", default="发动机怠速不稳",
                         help="输入症状文本（默认使用示例症状）")
     parser.add_argument("--top-k", type=int, default=3,
-                        help="故障定位 Top-K (默认: 3)")
+                        help="静态链接预测 Top-K (默认: 3)")
 
     parser.add_argument("--epochs", type=int, default=300,
                         help="训练轮数 (默认: 300)")
@@ -282,8 +285,8 @@ def main() -> None:
         print(f"\n🔍 输入: \"{query}\"")
         result = run_inference(
             model, dataset, query,
-            top_k_symptoms=5,
-            top_k_faults=args.top_k,
+            top_k=5,
+            device=args.device,
         )
         print(format_result_compact(result))
         print()
@@ -292,8 +295,8 @@ def main() -> None:
     detailed = run_inference(
         model, dataset,
         test_cases[0],
-        top_k_symptoms=5,
-        top_k_faults=args.top_k,
+        top_k=5,
+        device=args.device,
     )
     print(format_result(detailed))
 

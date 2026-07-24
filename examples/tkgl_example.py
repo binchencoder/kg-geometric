@@ -2,16 +2,16 @@
 """
 demo/tkgl_smallpedia_tkg.py
 =====================================================================
-基于 TKGL-Smallpedia 数据集的「时序知识图谱链接预测」训练 / 推理 入口
+基于 TKGL-Smallpedia 数据集的「时序链接预测」训练 / 推理 入口
 
 模型：TGAT 风格时序图注意力编码器 + 时间感知 DistMult 解码器
       （「时间」作为关系的一个属性：rel_repr = rel_emb + TimeEncoder(τ)）
 
 本文件现在是**薄入口**：模型 / 数据集 / 训练 / 推理逻辑已抽取到独立模块：
-  * src/model/temporal_model.py : TemporalKGModel + checkpoint 序列化
-  * src/dataset/tkgl_dataset.py : 数据集加载（load_tkgl_smallpedia / iter_train_batches）
-  * src/tkgl/train.py      : 训练主流程（run_training）
-  * src/tkgl/predict.py    : 推理与评测主流程（run_inference）
+  * src/model/tlp.py : TemporalKGModel + checkpoint 序列化
+  * src/dataset/tlp_dataset.py : 数据集加载（load_tkgl_smallpedia / iter_train_batches）
+  * src/tlp/train.py      : 训练主流程（run_training）
+  * src/tlp/predict.py    : 推理与评测主流程（run_inference）
 
 本文件只负责解析命令行参数，并委派给上述模块，保持
 `python demo/tkgl_smallpedia_tkg.py --mode train|infer ...` 的原有用法不变。
@@ -37,12 +37,12 @@ _ROOT = os.path.dirname(_HERE)
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from src.tkgl.train import run_training       # noqa: E402
-from src.tkgl.predict import run_inference    # noqa: E402
+from src.tlp.train import run_training       # noqa: E402
+from src.tlp.predict import run_inference    # noqa: E402
 
 
 def main():
-    parser = argparse.ArgumentParser(description="TKGL-Smallpedia 时序知识图谱链接预测")
+    parser = argparse.ArgumentParser(description="TKGL-Smallpedia 时序链接预测")
     parser.add_argument("--mode", choices=["train", "infer"], default="train",
                         help="train=训练并保存模型; infer=直接加载已训练模型做推理/评测")
     parser.add_argument("--data-dir", type=str,

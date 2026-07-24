@@ -20,7 +20,7 @@ from torch_geometric.data import Data
 
 from src.core.config import logger
 
-from .link_prediction import LinkPredictionGCN
+from link_prediction import LinkPredictionGCN
 
 if TYPE_CHECKING:
     from src.graph.sampler import AsyncSubgraphSampler

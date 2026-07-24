@@ -1,6 +1,6 @@
-"""变压器时序趋势预测推理脚本（可独立执行，零业务依赖）。
+"""变压器时序属性预测推理脚本（可独立执行，零业务依赖）。
 
-自包含地实现：R-GCN 故障诊断模型 / TGN 趋势预测模型 / 预测打印，全部集中在本文件，
+自包含地实现：R-GCN 静态链接预测模型 / TGN 属性预测模型 / 预测打印，全部集中在本文件，
 不依赖 demo/fault_prediction.py。推理所需的异构图由 train.py 训练时持久化到模型目录，
 本脚本直接加载，不再读取原始数据集。
 
@@ -25,7 +25,7 @@ _PROJECT_ROOT = os.path.abspath(os.path.dirname(__file__))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-from src.model import TGNOilTemperaturePredict  # noqa: E402
+from src.model import TGNModel  # noqa: E402
 
 # ===================== 全局配置 =====================
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -44,7 +44,7 @@ FEATURE_NUM = len(FEATURE_LIST)
 HIDDEN_DIM = 32
 
 
-# ===================== 1. 模型1：R-GCN 故障诊断模型 =====================
+# ===================== 1. 模型1：R-GCN 静态链接预测模型 =====================
 class RGCNFaultDiagnosis(torch.nn.Module):
     def __init__(self, hidden_dim, out_dim):
         super().__init__()
@@ -68,14 +68,14 @@ class RGCNFaultDiagnosis(torch.nn.Module):
         return logits, h2
 
 
-# ===================== 2. 模型2：TGN 时序趋势预测模型 =====================
+# ===================== 2. 模型2：TGN 时序属性预测模型 =====================
 # TGN 模型核心已抽取到 src/model/tgn.py，这里封装一个便捷工厂函数。
 def build_tgn_oil_temperature_predict(hidden_dim, num_time_slices):
     """构建一个用于变压器时序异构图的 TGN 油温预测模型。
 
     配置与原脚本保持完全一致，包括节点输入维度、边类型与预测头结构。
     """
-    return TGNOilTemperaturePredict(
+    return TGNModel(
         in_channels={
             "transformer": 3,
             "time_slice": FEATURE_NUM,
@@ -102,7 +102,7 @@ def build_tgn_oil_temperature_predict(hidden_dim, num_time_slices):
 
 # ===================== 3. 预测打印函数（仅输出预测结果，不依赖真实标签） =====================
 def predict_print(kg_data, diag_model, tgn_model, slice_idx):
-    """对指定时序切片执行故障诊断+趋势预测，完整打印预测结果（无需真实标签）"""
+    """对指定时序切片执行静态链接预测+属性预测，完整打印预测结果（无需真实标签）"""
     print("=" * 100)
     print(f"【变压器时序推理】切片ID：{slice_idx} | 时间：{kg_data['time_slice'].date_str[slice_idx]}")
     print("=" * 100)
@@ -114,14 +114,14 @@ def predict_print(kg_data, diag_model, tgn_model, slice_idx):
     for i, feat_name in enumerate(FEATURE_LIST):
         print(f"    {feat_name}: {slice_feat[i]:.4f}")
 
-    # 2. R-GCN故障诊断
+    # 2. R-GCN静态链接预测
     with torch.no_grad():
         health_logits, _ = diag_model(kg_data.x_dict, kg_data.edge_index_dict)
         pred_health_logits = health_logits[slice_idx]
         pred_health = torch.argmax(pred_health_logits).item()
         pred_health_prob = F.softmax(pred_health_logits, dim=0).cpu().numpy()
 
-    print(f"\n[2] R-GCN知识图谱故障诊断结果：")
+    print(f"\n[2] R-GCN知识图谱静态链接预测结果：")
     print(f"  预测健康状态：{HEALTH_MAPPING[pred_health]}")
     print(f"  各类别预测概率：")
     for label_id, state_name in HEALTH_MAPPING.items():
@@ -143,7 +143,7 @@ def predict_print(kg_data, diag_model, tgn_model, slice_idx):
     for rule in rules:
         print(f"  {rule}")
 
-    # 4. TGN时序趋势预测（模型输出是 z-score，需反标准化成摄氏度）
+    # 4. TGN时序属性预测（模型输出是 z-score，需反标准化成摄氏度）
     with torch.no_grad():
         future_ot_pred, fault_risk_pred, _ = tgn_model(kg_data)
         ot_mean_val = kg_data["time_slice"].ot_mean.item()
@@ -153,7 +153,7 @@ def predict_print(kg_data, diag_model, tgn_model, slice_idx):
         pred_fault_risk = fault_risk_pred[slice_idx].item()
 
     risk_level = "低风险" if pred_fault_risk < 0.3 else ("中风险" if pred_fault_risk < 0.7 else "高风险")
-    print(f"\n[4] TGN时序图模型趋势预测结果：")
+    print(f"\n[4] TGN时序图模型属性预测结果：")
     print(f"  未来3步预测油温：{pred_future_ot:.4f}℃")
     print(f"  未来故障发生概率：{pred_fault_risk:.2%}，风险等级：{risk_level}")
 
@@ -176,7 +176,7 @@ if __name__ == "__main__":
     import argparse
 
     # 模型/图谱目录，默认与 train.py 的 prediction.save_model_path 一致
-    parser = argparse.ArgumentParser(description="变压器时序趋势预测推理（不读取数据集）")
+    parser = argparse.ArgumentParser(description="变压器时序属性预测推理（不读取数据集）")
     parser.add_argument(
         "--model-dir", type=str,
         default="/mnt/work/code/python_workspace/kg-geometric/trained_models/trend",
@@ -209,13 +209,13 @@ if __name__ == "__main__":
     tgn_model.eval()
     print(f"已加载模型与知识图谱：\n  {diag_path}\n  {tgn_path}\n  {graph_path}")
 
-    # 3. 对最新的若干时序切片执行趋势预测（模拟对实时运行数据的预测）
+    # 3. 对最新的若干时序切片执行属性预测（模拟对实时运行数据的预测）
     HOLD_OUT_N = 10
     pred_idx = torch.tensor(
         np.arange(max(0, total_num - HOLD_OUT_N), total_num), dtype=torch.long
     ).to(DEVICE)
     print("\n" + "=" * 100)
-    print(f"【趋势预测】对最新 {pred_idx.shape[0]} 个时序切片执行故障诊断 + 油温趋势预测")
+    print(f"【属性预测】对最新 {pred_idx.shape[0]} 个时序切片执行静态链接预测 + 油温属性预测")
     print("=" * 100)
     for i in range(pred_idx.shape[0]):
         slice_id = pred_idx[i].item()

@@ -2,13 +2,13 @@
 """
 demo/tkgl_smallpedia_tkg.py
 =====================================================================
-基于 TKGL-Smallpedia 数据集的「时序知识图谱链接预测」训练 / 推理
+基于 TKGL-Smallpedia 数据集的「时序链接预测」训练 / 推理
 =====================================================================
 
 模型：TGAT 风格时序图注意力编码器 + 时间感知 DistMult 解码器
       （「时间」作为关系的一个属性：rel_repr = rel_emb + TimeEncoder(τ)）
 
-与 demo/temporal_kg_link_prediction.py、demo/employee_tkg_link_prediction.py 的区别：
+与 demo/temporal_kg_link_prediction.py、examples/employee_tkg_link_prediction.py 的区别：
   * 本文件【自包含】，内置一套【向量化、带邻居采样】的 TGAT，能撑住
     TKGL-Smallpedia 这种规模（30 万实体 / 150 万边），旧的逐实体 Python 循环
     在此规模下会慢到不可用。
@@ -660,7 +660,7 @@ def run_interactive_infer(model, data, device, topk, k_neg):
 # 7. 主函数
 # ====================================================================
 def main():
-    parser = argparse.ArgumentParser(description="TKGL-Smallpedia 时序知识图谱链接预测")
+    parser = argparse.ArgumentParser(description="TKGL-Smallpedia 时序链接预测")
     parser.add_argument("--mode", choices=["train", "infer"], default="train",
                         help="train=训练并保存模型; infer=直接加载已训练模型做推理/评测")
     parser.add_argument("--data-dir", type=str,

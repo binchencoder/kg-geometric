@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-src/dataset/tkgl_dataset.py
+src/dataset/tlp_dataset.py
 =====================================================================
 TKGL-Smallpedia 数据集加载器（纯 Python，不依赖 torch）
 
@@ -120,7 +120,7 @@ def iter_train_batches(data_dir,
         yield np.array(batch, dtype=np.int64)
 
 
-def load_tkgl_data(
+def load_tlp_data(
         data_dir: str,
         dynamic_edge_file: str,
         static_edge_file: str,
@@ -129,7 +129,7 @@ def load_tkgl_data(
         static_sentinel=DEFAULT_STATIC_SENTINEL,
         build_train_arrays=True
 ):
-    """加载 TKGL 数据集。
+    """加载 TLP 数据集。
 
     参数：
         data_dir          : 数据集所在目录（绝对或相对路径）。动态边文件与
@@ -317,7 +317,7 @@ if __name__ == "__main__":
     # 直接运行时用相对路径回退到仓库根目录的 data 目录
     # （src/dataset 距仓库根两层，故取两次 dirname）。
     _ROOT = os.path.dirname(os.path.dirname(here))
-    d = load_tkgl_data(
+    d = load_tlp_data(
         os.path.join(_ROOT, "data", "tkgl-smallpedia"),
         "tkgl-smallpedia_edgelist.csv",
         "tkgl-smallpedia_static_edgelist.csv",

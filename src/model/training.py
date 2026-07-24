@@ -22,7 +22,7 @@ import torch.nn as nn
 from sklearn.metrics import accuracy_score, classification_report, f1_score, mean_absolute_error
 
 from src.core.config import logger
-from .gcn import FaultGCN
+from .gcn import GCNModel
 from .rgcn import FaultRGCN
 
 
@@ -75,7 +75,7 @@ def split_masks(
 
 
 def train_gcn(
-        model: FaultGCN,
+        model: GCNModel,
         data,
         epochs: int = 200,
         lr: float = 0.01,
@@ -86,7 +86,7 @@ def train_gcn(
 
     Parameters
     ----------
-    model : FaultGCN
+    model : GCNModel
         GCN 模型实例。
     data : Data
         包含 x, edge_index, y, train_mask, val_mask 的图数据。
@@ -248,7 +248,7 @@ def train(
     Parameters
     ----------
     model : nn.Module
-        FaultGCN 或 FaultRGCN 模型实例。
+        GCNModel 或 FaultRGCN 模型实例。
     data : Data
         包含 x, edge_index, y, train_mask, val_mask 的图数据。
     epochs : int
@@ -289,12 +289,12 @@ def train(
 def evaluate(model: nn.Module, data) -> dict:
     """在测试集上评估模型并打印分类报告。
 
-    兼容 FaultGCN 和 FaultRGCN。
+    兼容 GCNModel 和 FaultRGCN。
 
     Parameters
     ----------
     model : nn.Module
-        已训练的模型（FaultGCN 或 FaultRGCN）。
+        已训练的模型（GCNModel 或 FaultRGCN）。
     data : Data
         包含 test_mask 的图数据。
 
@@ -387,7 +387,7 @@ def train_tgn(
     Parameters
     ----------
     tgn_model : nn.Module
-        TGNOilTemperaturePredict 实例（forward 返回 future_ot, fault_risk, _）。
+        TGNModel 实例（forward 返回 future_ot, fault_risk, _）。
     hetero_data : HeteroData
         需包含 ``x_dict / edge_index_dict / edge_time / y_health / y_future_ot / y_future_ot_norm / ot_mean / ot_std``。
     train_idx, test_idx : torch.Tensor
@@ -417,7 +417,7 @@ def train_tgn(
     best_metrics: Dict[str, float] = {}
 
     if verbose:
-        print("\n===== 开始训练 TGN 时序趋势预测 =====")
+        print("\n===== 开始训练 TGN 时序属性预测 =====")
 
     train_idx_list = train_idx.tolist()
     use_batch = batch_size and batch_size > 0 and batch_size < len(train_idx_list)
@@ -497,7 +497,7 @@ def train_joint_rgcn_tgn(
         batch_size: int = 0,
         verbose: bool = True,
 ) -> Tuple[nn.Module, nn.Module, Dict[str, float]]:
-    """联合训练 R-GCN（故障诊断，分类）+ TGN（油温+风险，双任务）。
+    """联合训练 R-GCN（静态链接预测，分类）+ TGN（油温+风险，双任务）。
 
     统一使用 Adam 优化两个模型的参数，loss 为三项之和：
     ``CrossEntropy(health) + MSE(future_ot_norm) + BCE(risk)``。
@@ -505,9 +505,9 @@ def train_joint_rgcn_tgn(
     Parameters
     ----------
     diag_model : nn.Module
-        R-GCN 故障诊断模型（forward 返回 health_logits, _）。
+        R-GCN 静态链接预测模型（forward 返回 health_logits, _）。
     tgn_model : nn.Module
-        TGNOilTemperaturePredict 实例。
+        TGNModel 实例。
     hetero_data : HeteroData
         见 :func:`train_tgn`。
     train_idx, test_idx : torch.Tensor
@@ -559,7 +559,7 @@ def train_joint_rgcn_tgn(
 
     if verbose:
         mode = f"小批量(batch_size={batch_size})" if use_batch else "全量"
-        print(f"\n===== 开始联合训练 R-GCN故障诊断 + TGN时序趋势预测 [{mode}] =====")
+        print(f"\n===== 开始联合训练 R-GCN静态链接预测 + TGN时序属性预测 [{mode}] =====")
 
     for epoch in range(epochs):
         diag_model.train()
@@ -649,7 +649,7 @@ def train_joint_rgcn_tgn(
 
     if verbose:
         print(
-            f"\n训练完成！最优故障诊断准确率: {best_diag_acc:.4f}，"
+            f"\n训练完成！最优静态链接预测准确率: {best_diag_acc:.4f}，"
             f"最优油温预测MAE: {best_ot_mae:.4f}"
         )
         if hold_out_n > 0:

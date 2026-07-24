@@ -1,6 +1,6 @@
 """GCN 模型 —— 用于知识图谱节点分类的 2 层图卷积网络。
 
-提供 FaultGCN 类，支持 Data 和 HeteroData 两种图数据结构。
+提供 GCNModel 类，支持 Data 和 HeteroData 两种图数据结构。
 """
 
 from __future__ import annotations
@@ -14,8 +14,8 @@ from torch_geometric.data import Data, HeteroData
 from torch_geometric.nn import GCNConv
 
 
-class FaultGCN(nn.Module):
-    """2 层 GCN + 线性分类器，用于知识图谱故障节点分类。
+class GCNModel(nn.Module):
+    """2 层 GCN + 线性分类器，可用于知识图谱故障节点分类。
 
     可同时接受 PyG Data 和 HeteroData 两种图格式。
     通过 encode() 方法可获取中间节点嵌入，用于相似度推理。
@@ -41,7 +41,7 @@ class FaultGCN(nn.Module):
     def encode(self, data) -> torch.Tensor:
         """前向传播获取节点嵌入（不含分类器）。
 
-        用于 Top-K 故障诊断中的余弦相似度计算。
+        用于 Top-K 静态链接预测中的余弦相似度计算。
         """
         x, edge_index = self._extract(data)
         x = self.conv1(x, edge_index)

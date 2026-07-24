@@ -1,6 +1,6 @@
 """训练+推理集成管线 —— 端到端的 ES 数据读取 → 训练 → 评估 → 故障推理。
 
-封装完整的 GCN 训练和 Top-K 故障诊断流程，支持全图和 NeighborLoader 两种模式。
+封装完整的 GCN 训练和 Top-K 静态链接预测流程，支持全图和 NeighborLoader 两种模式。
 """
 
 from __future__ import annotations
@@ -14,13 +14,13 @@ import torch.nn.functional as F
 from torch_geometric.data import Data, HeteroData
 
 from src.core.config import logger
-from src.model.gcn import FaultGCN
+from src.model.gcn import GCNModel
 
 
 class KGTrainInferPipeline:
     """端到端：ES 数据读取 → 训练 → 评估 → 故障推理。
 
-    封装完整的 GCN 训练和 Top-K 故障诊断流程，可与 ES 全图/流式
+    封装完整的 GCN 训练和 Top-K 静态链接预测流程，可与 ES 全图/流式
     两种数据模式配合使用。
 
     使用示例::
@@ -62,12 +62,12 @@ class KGTrainInferPipeline:
         self.weight_decay = weight_decay
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
-        self.model: Optional[FaultGCN] = None
+        self.model: Optional[GCNModel] = None
         self.optimizer = None
         self.criterion = nn.CrossEntropyLoss()
 
-    def _init_model(self) -> FaultGCN:
-        model = FaultGCN(in_dim=self.in_dim, hidden_dim=self.hidden_dim)
+    def _init_model(self) -> GCNModel:
+        model = GCNModel(in_dim=self.in_dim, hidden_dim=self.hidden_dim)
         if self.num_classes != 2:
             model.classifier = nn.Linear(self.hidden_dim, self.num_classes)
         model.to(self.device)
@@ -88,7 +88,7 @@ class KGTrainInferPipeline:
             log_interval: int = 50,
             verbose: bool = True,
     ) -> Dict[str, list]:
-        """在全图上训练 FaultGCN（使用 train/val mask）。
+        """在全图上训练 GCNModel（使用 train/val mask）。
 
         Returns
         -------
@@ -182,7 +182,7 @@ class KGTrainInferPipeline:
             data: Union[Data, HeteroData],
             y: torch.Tensor,
             test_mask: torch.Tensor,
-            model: Optional[FaultGCN] = None,
+            model: Optional[GCNModel] = None,
     ) -> Dict[str, float]:
         """在测试集上评估模型。
 
@@ -214,10 +214,10 @@ class KGTrainInferPipeline:
             "f1": float(f1_score(test_true, test_pred, zero_division=0)),
         }
 
-    # ---- Top-K 故障诊断推理 ----
+    # ---- Top-K 静态链接预测推理 ----
     @staticmethod
     def infer_topk(
-            model: FaultGCN,
+            model: GCNModel,
             data: Union[Data, HeteroData],
             symptoms: List[str],
             node_to_idx: Dict[str, int],
@@ -283,10 +283,10 @@ class KGTrainInferPipeline:
         }, path)
         logger.info("模型已保存至 %s", filepath)
 
-    def load_model(self, filepath: str) -> FaultGCN:
+    def load_model(self, filepath: str) -> GCNModel:
         """从磁盘加载模型参数。"""
         checkpoint = torch.load(filepath, map_location=self.device, weights_only=False)
-        model = FaultGCN(
+        model = GCNModel(
             in_dim=checkpoint["in_dim"],
             hidden_dim=checkpoint["hidden_dim"],
         )

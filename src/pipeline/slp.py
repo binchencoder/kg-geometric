@@ -1,8 +1,8 @@
-"""故障诊断推理 —— Top-K 故障根因排序。
+"""静态链接预测推理 —— Top-K 候选节点相似度排序。
 
-基于症状节点嵌入的余弦相似度，对候选故障节点进行排序。
+基于症状节点嵌入的余弦相似度，对候选节点进行排序。
 
-同时支持 FaultGCN（GCN 模型，`model.encode(data)`）和 FaultRGCN（R-GCN 模型，
+同时支持 GCNModel（GCN 模型，`model.encode(data)`）和 FaultRGCN（R-GCN 模型，
 `model.encode(edge_index, edge_type)`）两种接口。
 """
 
@@ -13,7 +13,7 @@ from typing import Dict, List, Sequence, Tuple
 import torch
 import torch.nn.functional as F
 
-from src.model.gcn import FaultGCN
+from src.model.gcn import GCNModel
 from src.model.rgcn import FaultRGCN
 
 
@@ -23,7 +23,7 @@ def _extract_embeddings(
 ) -> torch.Tensor:
     """根据模型类型适配 encode 接口，返回节点嵌入张量。
 
-    - FaultGCN: ``model.encode(data)`` —— 接受 PyG Data 对象
+    - GCNModel: ``model.encode(data)`` —— 接受 PyG Data 对象
     - FaultRGCN: ``model.encode(edge_index, edge_type)`` —— 接受边索引与边类型
     """
     model.eval()
@@ -37,11 +37,11 @@ def _extract_embeddings(
                 )
             return model.encode(edge_index, edge_type)
         else:
-            # 兼容 FaultGCN 及其他提供 encode(data) 接口的模型
+            # 兼容 GCNModel 及其他提供 encode(data) 接口的模型
             return model.encode(data)
 
 
-def topk_fault_diagnosis(
+def topk_static_link_prediction(
     model,
     data,
     node_to_idx: Dict[str, int],
@@ -51,11 +51,11 @@ def topk_fault_diagnosis(
 ) -> List[Tuple[str, float]]:
     """给定症状节点，基于嵌入余弦相似度推理最可能的故障根因。
 
-    自动适配 ``FaultGCN`` / ``FaultRGCN`` 两种模型。
+    自动适配 ``GCNModel`` / ``FaultRGCN`` 两种模型。
 
     Parameters
     ----------
-    model : FaultGCN or FaultRGCN
+    model : GCNModel or FaultRGCN
         已训练好的图神经网络模型。
     data
         图数据（PyG Data，需包含 edge_index；对 FaultRGCN 还需含 edge_type）。
@@ -96,17 +96,17 @@ def topk_fault_diagnosis(
     return ranked[:top_k]
 
 
-def print_topk_diagnosis(results: List[Tuple[str, float]], symptoms: Sequence[str]) -> None:
-    """格式化输出 Top-K 故障诊断结果。
+def print_topk_static_link_prediction(results: List[Tuple[str, float]], symptoms: Sequence[str]) -> None:
+    """格式化输出 Top-K 静态链接预测结果。
 
     Parameters
     ----------
     results : List[Tuple[str, float]]
-        topk_fault_diagnosis 的返回值。
+        topk_static_link_prediction 的返回值。
     symptoms : Sequence[str]
         输入的症状节点名称。
     """
     print("\nInput symptoms:", ", ".join(symptoms))
-    print("Top-K fault diagnosis results:")
-    for rank, (fault, score) in enumerate(results, start=1):
-        print(f"  {rank}. {fault:<15} score={score:.4f}")
+    print("Top-K static link prediction results:")
+    for rank, (node, score) in enumerate(results, start=1):
+        print(f"  {rank}. {node:<15} score={score:.4f}")

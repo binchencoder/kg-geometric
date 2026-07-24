@@ -19,7 +19,7 @@ from src.core.types import Triple
 class TripleToDatasetConverter:
     """将三元组列表转换为 KGFaultDataset 所需的数据结构。
 
-    生成的 Data 对象可直接用于 FaultGCN 模型训练。
+    生成的 Data 对象可直接用于 GCNModel 模型训练。
     """
 
     def __init__(

@@ -49,7 +49,7 @@ from src.core.config import load_health_mapping, logger  # noqa: E402
 # 健康状态标签映射（从 config/config.yaml 读取）
 # ---------------------------------------------------------------------------
 # 懒加载：首次调用 get_health_mapping() 时才读取配置并打日志，
-# 避免本模块被 import 时（如 src/tkgl 仅需要 src.dataset.tkgl_dataset）
+# 避免本模块被 import 时（如 src/tlp 仅需要 src.dataset.tlp_dataset）
 # 就触发整条 src 包导入链并输出无关 INFO 日志。
 
 def get_health_mapping() -> Dict[int, str]:

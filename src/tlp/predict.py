@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-src/tkgl/predict.py
+src/tlp/predict.py
 =====================================================================
-TKGL-Smallpedia 时序知识图谱链接预测 —— 推理与评测
+TKGL-Smallpedia 时序链接预测 —— 推理与评测
 
 包含：
   * evaluate_filtered      : 过滤式 MRR / Hits@k 评测（采样负样本）
@@ -14,7 +14,7 @@ TKGL-Smallpedia 时序知识图谱链接预测 —— 推理与评测
   * run_inference          : 推理主流程（加载 checkpoint → 手动/评测/示例）
   * main                   : 命令行入口
 
-模型与 checkpoint 序列化见 src/model/tkgl.py；数据集加载见 src/dataset/tkgl_dataset.py。
+模型与 checkpoint 序列化见 src/model/tlp.py；数据集加载见 src/dataset/tlp_dataset.py。
 """
 
 import argparse
@@ -26,13 +26,13 @@ import numpy as np
 import torch
 
 # 项目根目录加入 sys.path，使以脚本方式运行本文件时 `import src.model...` 等
-# 包内绝对导入可解析（`python -m src.tkgl.predict` 时 cwd 已在 path，无需此步）。
+# 包内绝对导入可解析（`python -m src.tlp.predict` 时 cwd 已在 path，无需此步）。
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from src.core.config import TKGLPredictionConfig, InferenceConfig
-from src.model.tkgl import load_checkpoint  # noqa: E402
+from src.core.config import TLPConfig, InferenceConfig
+from src.model.tlp import load_checkpoint  # noqa: E402
 
 
 # ====================================================================
@@ -287,7 +287,7 @@ def run_inference(args, device):
     if not ckpt_path:
         raise SystemExit(
             "❌ 未指定模型路径。请通过 --model-path 指定，或在 config/config.yaml 的 "
-            "inference.tkgl_prediction.model_path 中配置。")
+            "inference.tlp_prediction.model_path 中配置。")
     if not os.path.exists(ckpt_path):
         raise SystemExit(f"❌ 未找到模型文件: {ckpt_path}")
     print(f"📥 加载已训练模型: {ckpt_path}")
@@ -350,11 +350,11 @@ def run_inference(args, device):
         print(f"    => 真实尾是否在 Top-{args.topk}: {hit}")
 
 
-# 默认TKGL模型推理配置
-def _default_tkgl_prediction() -> TKGLPredictionConfig:
+# 默认TLP模型推理配置
+def _default_tlp_prediction() -> TLPConfig:
     try:
         from src.core.config import InferenceConfig
-        return InferenceConfig.default().tkgl_prediction
+        return InferenceConfig.default().tlp_config
     except Exception:  # noqa: BLE001
         return {}
 
@@ -369,9 +369,9 @@ def _default_inference() -> InferenceConfig:
 
 
 def _build_arg_parser():
-    parser = argparse.ArgumentParser(description="TKGL-Smallpedia 时序知识图谱链接预测（推理）")
+    parser = argparse.ArgumentParser(description="动态链接预测（推理）")
     parser.add_argument("--model-path", type=str,
-                        default=_default_tkgl_prediction().model_path,
+                        default=_default_tlp_prediction().model_path,
                         help="已训练模型 .pt 路径，默认来自 config.yaml")
     parser.add_argument("--device", type=str, default=_default_inference().device,
                         help="推理设备 auto/cpu/cuda，默认来自 config.yaml")

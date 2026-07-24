@@ -3,7 +3,7 @@
 包含：
 - TripleToDatasetConverter: 三元组列表 → PyG Data 转换器
 - build_pipeline: 一键从 ES 读取 → 构建三元组 → 转换数据集
-- KGTripleDataset: 车辆故障诊断知识图谱（内置示例数据集）
+- KGTripleDataset: 车辆静态链接预测知识图谱（内置示例数据集）
 - KGFaultDemoDataset: 工业故障小型演示数据集
 - LinkPredictionData: 链接预测数据集（全量模式，边划分 + 负采样）
 - LinkPredictionStreamingData: 流式链接预测数据集（海量三元组，边查边训）

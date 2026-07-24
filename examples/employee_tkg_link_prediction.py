@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-demo/employee_tkg_link_prediction.py
+examples/employee_tkg_link_prediction.py
 =====================================================================
 基于「中文时序知识图谱 (TKG)」的员工 - 公司雇佣关系 链接预测 (demo)
 =====================================================================
@@ -48,7 +48,7 @@ demo/employee_tkg_link_prediction.py
 
 ---------------------------------------------------------------------
 运行:
-    python demo/employee_tkg_link_prediction.py
+    python examples/employee_tkg_link_prediction.py
 （也可加 --epochs / --dim / --batch / --neg / --lr 等参数）
 """
 
@@ -66,7 +66,7 @@ try:
         Entity, Quad, TemporalKGModel, sample_negative, train,
         evaluate, predict_tails, candidate_entities, fmt_quad,
     )
-except ModuleNotFoundError:  # 从项目根目录 `python demo/employee_tkg_link_prediction.py`
+except ModuleNotFoundError:  # 从项目根目录 `python examples/employee_tkg_link_prediction.py`
     from demo.temporal_kg_link_prediction import (
         Entity, Quad, TemporalKGModel, sample_negative, train,
         evaluate, predict_tails, candidate_entities, fmt_quad,

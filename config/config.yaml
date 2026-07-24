@@ -57,8 +57,8 @@ relation_mapping:
 
 
 
-# -------------------- 故障诊断训练参数（R-GCN + 三元组知识图谱） --------------------
-diagnosis:
+# -------------------- 静态链接预测训练参数（R-GCN + 三元组知识图谱） --------------------
+slp_prediction:
   # 训练轮数
   epochs: 300
   # R-GCN 隐藏层维度
@@ -74,10 +74,10 @@ diagnosis:
   # 模型保存路径（留空/null 表示不保存）
   save_model_path: /mnt/work/code/python_workspace/kg-geometric/trained_models/diagnosis
 
-# -------------------- 故障预测训练参数（时序异构图 + CSV） --------------------
-prediction:
+# -------------------- 时序属性预测训练参数（时序异构图 + CSV） --------------------
+tap_prediction:
   # 变压器时序 CSV 数据文件路径
-  csv_path: /home/binchen/Workspaces/PIE-Knowledge/故障诊断+故障预测/电力变压器数据集-ETDataset/ETDataset/ETT-small/ETTh2.csv
+  csv_path: /home/binchen/Workspaces/PIE-Knowledge/故障诊断+动态链接预测/电力变压器数据集-ETDataset/ETDataset/ETT-small/ETTh2.csv
   # transformer 节点 ID
   transformer_id: 0
   # 从数据集尾部预留的未知样本数
@@ -104,7 +104,7 @@ health_mapping:
 
 # -------------------- 训练脚本全局参数 --------------------
 training:
-  # 训练模式: both / diagnosis / prediction
+  # 训练模式: both / slp / tap
   mode: both
   # 随机种子
   seed: 42
@@ -119,21 +119,21 @@ inference:
   # 推理设备: auto / cpu / cuda / cuda:0 等（auto 自动选择 cuda 或 cpu）
   device: auto
 
-  # 故障诊断推理参数
-  link_prediction:
+  # 静态链接预测推理参数
+  slp_prediction:
     # 模型文件路径
-    model_path: /mnt/work/code/python_workspace/kg-geometric/trained_models/diagnosis/
+    model_path: /mnt/work/code/python_workspace/kg-geometric/trained_models/slp/
     # 输入实例文本（多个症状以换行符 \n 分隔）
     instance: "发动机怠速不稳\n加速迟缓"
     # 返回 Top-K 故障诊断结果
     top_k: 3
 
-  # 故障预测推理参数
-  trend_prediction:
+  # 动态链接预测模型推理参数
+  tlp_prediction:
     # 模型文件路径
-    model_path: /mnt/work/code/python_workspace/kg-geometric/trained_models/trend
+    model_path: /mnt/work/code/python_workspace/kg-geometric/trained_models/tlp/tkgl_smallpedia_model.pt
 
-  # 时序链接预测模型推理参数
-  tkgl_prediction:
+  # 时序属性预测推理参数
+  tap_prediction:
     # 模型文件路径
-    model_path: /mnt/work/code/python_workspace/kg-geometric/trained_models/tkgl/tkgl_smallpedia_model.pt
+    model_path: /mnt/work/code/python_workspace/kg-geometric/trained_models/tap/

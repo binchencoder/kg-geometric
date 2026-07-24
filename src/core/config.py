@@ -251,12 +251,12 @@ def _resolve_training_config(path: str = DEFAULT_CONFIG_PATH) -> Dict[str, Any]:
     return merged
 
 
-def _resolve_diagnosis_config(path: str = DEFAULT_CONFIG_PATH) -> Dict[str, Any]:
+def _resolve_slp_config(path: str = DEFAULT_CONFIG_PATH) -> Dict[str, Any]:
     root = _load_yaml_config(path)
-    section_data = _require_section(root, "diagnosis", path)
+    section_data = _require_section(root, "slp_prediction", path)
     merged = _validate_section_opt(
         section_data,
-        section="diagnosis",
+        section="slp_prediction",
         required=_DIAGNOSIS_REQUIRED,
         int_fields=_DIAGNOSIS_FIELDS_INT,
         float_fields=_DIAGNOSIS_FIELDS_FLOAT,
@@ -269,12 +269,12 @@ def _resolve_diagnosis_config(path: str = DEFAULT_CONFIG_PATH) -> Dict[str, Any]
     return merged
 
 
-def _resolve_prediction_config(path: str = DEFAULT_CONFIG_PATH) -> Dict[str, Any]:
+def _resolve_tap_config(path: str = DEFAULT_CONFIG_PATH) -> Dict[str, Any]:
     root = _load_yaml_config(path)
-    section_data = _require_section(root, "prediction", path)
+    section_data = _require_section(root, "tap_prediction", path)
     merged = _validate_section_opt(
         section_data,
-        section="prediction",
+        section="tap_prediction",
         required=_PREDICTION_REQUIRED,
         int_fields=_PREDICTION_FIELDS_INT,
         float_fields=_PREDICTION_FIELDS_FLOAT,
@@ -306,8 +306,8 @@ class TrainingConfig:
 
 
 @dataclass(frozen=True)
-class DiagnosisTrainingConfig:
-    """故障诊断训练配置（从 ``config/config.yaml`` 加载）。"""
+class SLPTrainingConfig:
+    """静态链接预测训练配置（从 ``config/config.yaml`` 加载）。"""
     epochs: int
     hidden_dim: int
     num_layers: int
@@ -317,12 +317,12 @@ class DiagnosisTrainingConfig:
     save_model_path: Optional[str]
 
     @classmethod
-    def default(cls) -> "DiagnosisTrainingConfig":
+    def default(cls) -> "SLPTrainingConfig":
         return cls.from_yaml(DEFAULT_CONFIG_PATH)
 
     @classmethod
-    def from_yaml(cls, path: str) -> "DiagnosisTrainingConfig":
-        m = _resolve_diagnosis_config(path)
+    def from_yaml(cls, path: str) -> "SLPTrainingConfig":
+        m = _resolve_slp_config(path)
         return cls(
             epochs=int(m["epochs"]),
             hidden_dim=int(m["hidden_dim"]),
@@ -335,8 +335,8 @@ class DiagnosisTrainingConfig:
 
 
 @dataclass(frozen=True)
-class PredictionTrainingConfig:
-    """故障预测训练配置（从 ``config/config.yaml`` 加载）。"""
+class TAPTrainingConfig:
+    """时序属性预测训练配置（从 ``config/config.yaml`` 加载）。"""
     csv_path: str
     transformer_id: int
     hold_out: int
@@ -347,12 +347,12 @@ class PredictionTrainingConfig:
     save_model_path: Optional[str]
 
     @classmethod
-    def default(cls) -> "PredictionTrainingConfig":
+    def default(cls) -> "TAPTrainingConfig":
         return cls.from_yaml(DEFAULT_CONFIG_PATH)
 
     @classmethod
-    def from_yaml(cls, path: str) -> "PredictionTrainingConfig":
-        m = _resolve_prediction_config(path)
+    def from_yaml(cls, path: str) -> "TAPTrainingConfig":
+        m = _resolve_tap_config(path)
         return cls(
             csv_path=m["csv_path"],
             transformer_id=int(m["transformer_id"]),
@@ -367,12 +367,12 @@ class PredictionTrainingConfig:
 
 def load_training_configs(
         path: str = DEFAULT_CONFIG_PATH,
-) -> tuple[TrainingConfig, DiagnosisTrainingConfig, PredictionTrainingConfig]:
+) -> tuple[TrainingConfig, SLPTrainingConfig, TAPTrainingConfig]:
     """一次性加载全部训练配置。"""
     return (
         TrainingConfig.from_yaml(path),
-        DiagnosisTrainingConfig.from_yaml(path),
-        PredictionTrainingConfig.from_yaml(path),
+        SLPTrainingConfig.from_yaml(path),
+        TAPTrainingConfig.from_yaml(path),
     )
 
 
@@ -461,15 +461,15 @@ def _resolve_inference_config(
 ) -> Dict[str, Any]:
     """从 YAML 的 `inference:` 段读取推理引擎参数（predict.py）。
 
-    当前结构（支持两路子配置：link_prediction 与 trend_prediction）::
+    当前结构（支持两路子配置：slp_prediction 与 tap_prediction）::
 
         inference:
           device: cpu
-          link_prediction:
+          slp_prediction:
             model_path: /path/to/kg_fault_model.pth
             instance: "振动过高\\n温度过高"
             top_k: 3
-          trend_prediction:
+          tap_prediction:
             model_path: /path/to/kg_trend_model.pth
     """
     root = _load_yaml_config(path)
@@ -484,20 +484,20 @@ def _resolve_inference_config(
     if not isinstance(device, str) or not device.strip():
         device = "cpu"
 
-    lp = section_data.get("link_prediction") or {}
-    if not isinstance(lp, dict):
-        lp = {}
+    slp = section_data.get("slp_prediction") or {}
+    if not isinstance(slp, dict):
+        slp = {}
 
-    model_path = lp.get("model_path", "")
-    instance = lp.get("instance", "")
-    top_k = int(lp.get("top_k", 3))
+    model_path = slp.get("model_path", "")
+    instance = slp.get("instance", "")
+    top_k = int(slp.get("top_k", 3))
 
     if not isinstance(model_path, str):
         model_path = str(model_path) if model_path is not None else ""
     if not isinstance(instance, str):
         instance = str(instance) if instance is not None else ""
 
-    # 兼容字段：models_dir 由 link_prediction.model_path 的父目录推导
+    # 兼容字段：models_dir 由 slp.model_path 的父目录推导
     if model_path.strip():
         models_dir = str(Path(model_path).parent)
     else:
@@ -505,62 +505,62 @@ def _resolve_inference_config(
     if not models_dir.strip():
         models_dir = "./models"
 
-    tp = section_data.get("trend_prediction") or {}
-    if not isinstance(tp, dict):
-        tp = {}
-    trend_model_path = tp.get("model_path", "")
-    if not isinstance(trend_model_path, str):
-        trend_model_path = str(trend_model_path) if trend_model_path is not None else ""
+    tap = section_data.get("tap_prediction") or {}
+    if not isinstance(tap, dict):
+        tap = {}
+    tap_model_path = tap.get("model_path", "")
+    if not isinstance(tap_model_path, str):
+        tap_model_path = str(tap_model_path) if tap_model_path is not None else ""
 
-    tkp = section_data.get("tkgl_prediction") or {}
-    if not isinstance(tkp, dict):
-        tkp = {}
-    tkgl_model_path = tkp.get("model_path", "")
-    if not isinstance(tkgl_model_path, str):
-        tkgl_model_path = str(tkgl_model_path) if tkgl_model_path is not None else ""
+    tlp = section_data.get("tlp_prediction") or {}
+    if not isinstance(tlp, dict):
+        tlp = {}
+    tlp_model_path = tlp.get("model_path", "")
+    if not isinstance(tlp_model_path, str):
+        tlp_model_path = str(tlp_model_path) if tlp_model_path is not None else ""
 
     merged: Dict[str, Any] = {
         "host": host.strip(),
         "port": port,
         "device": device.strip(),
         "models_dir": models_dir.strip(),
-        "link_prediction": {
+        "slp_config": {
             "model_path": model_path.strip(),
             "instance": instance,
             "top_k": top_k,
         },
-        "trend_prediction": {
-            "model_path": trend_model_path.strip(),
+        "tap_config": {
+            "model_path": tap_model_path.strip(),
         },
-        "tkgl_prediction": {
-            "model_path": tkgl_model_path.strip(),
+        "tlp": {
+            "model_path": tlp_model_path.strip(),
         },
     }
     logger.info(
-        "已加载 inference 配置 | device=%s | models_dir=%s | link.top_k=%d",
+        "已加载 inference 配置 | device=%s | models_dir=%s | slp_config.top_k=%d",
         merged["device"], merged["models_dir"],
-        merged["link_prediction"]["top_k"],
+        merged["slp_config"]["top_k"],
     )
     return merged
 
 
 @dataclass(frozen=True)
-class LinkPredictionConfig:
-    """链接预测（故障诊断）推理子配置。"""
+class SLPConfig:
+    """SLP（静态链接预测）推理子配置。"""
     model_path: str
     instance: str
     top_k: int
 
 
 @dataclass(frozen=True)
-class TrendPredictionConfig:
-    """趋势预测推理子配置。"""
+class TAPConfig:
+    """TAP（时序属性预测）推理子配置。"""
     model_path: str
 
 
 @dataclass(frozen=True)
-class TKGLPredictionConfig:
-    """时序链接预测推理子配置。"""
+class TLPConfig:
+    """TLP（时序链接预测）推理子配置。"""
     model_path: str
 
 
@@ -570,19 +570,23 @@ class InferenceConfig:
     host: str
     port: int
     device: str
-    link_prediction: LinkPredictionConfig
-    trend_prediction: TrendPredictionConfig
-    tkgl_prediction: TKGLPredictionConfig
+
+    # 静态链接预测推理配置
+    slp_config: SLPConfig
+    # 动态链接预测推理配置
+    tlp_config: TLPConfig
+    # 时序属性预测推理配置
+    tap_config: TAPConfig
 
     @property
     def instance(self) -> str:
-        """兼容字段：返回 link_prediction.instance。"""
-        return self.link_prediction.instance
+        """兼容字段：返回 slp_config.instance。"""
+        return self.slp_config.instance
 
     @property
     def top_k(self) -> int:
-        """兼容字段：返回 link_prediction.top_k。"""
-        return self.link_prediction.top_k
+        """兼容字段：返回 slp_config.top_k。"""
+        return self.slp_config.top_k
 
     @classmethod
     def default(cls) -> "InferenceConfig":
@@ -595,16 +599,16 @@ class InferenceConfig:
             host=str(m["host"]),
             port=int(m["port"]),
             device=str(m["device"]),
-            link_prediction=LinkPredictionConfig(
-                model_path=str(m["link_prediction"]["model_path"]),
-                instance=str(m["link_prediction"]["instance"]),
-                top_k=int(m["link_prediction"]["top_k"]),
+            slp_config=SLPConfig(
+                model_path=str(m["slp_config"]["model_path"]),
+                instance=str(m["slp_config"]["instance"]),
+                top_k=int(m["slp_config"]["top_k"]),
             ),
-            trend_prediction=TrendPredictionConfig(
-                model_path=str(m["trend_prediction"]["model_path"]),
+            tlp_config=TLPConfig(
+                model_path=str(m["tlp"]["model_path"]),
             ),
-            tkgl_prediction=TKGLPredictionConfig(
-                model_path=str(m["tkgl_prediction"]["model_path"]),
+            tap_config=TAPConfig(
+                model_path=str(m["tap_config"]["model_path"]),
             ),
         )
 
@@ -796,13 +800,13 @@ def load_kg_config(path: str = DEFAULT_CONFIG_PATH) -> KnowledgeGraphSchema:
     return KnowledgeGraphSchema.from_yaml(path)
 
 
-# -------------------- 故障诊断关系映射 --------------------
+# -------------------- 静态链接预测关系映射 --------------------
 def _resolve_relation_mapping_config(
         path: str = DEFAULT_CONFIG_PATH,
 ) -> Dict[str, str]:
     """从 YAML 的 `relation_mapping:` 段读取语义角色 → 关系名映射。
 
-    该映射用于 ``KGTripleDataset.get_fault_info`` 等场景，将
+    该映射用于 ``KGTripleDataset.get_node_relations`` 等场景，将
     causes/actions/tools 等语义角色映射到图谱中实际的关系名称。
 
     YAML 格式示例::
@@ -860,7 +864,7 @@ def _resolve_relation_mapping_config(
 
 @dataclass(frozen=True)
 class RelationMappingConfig:
-    """故障诊断关系映射配置（从 ``config/config.yaml`` 加载）。
+    """静态链接预测关系映射配置（从 ``config/config.yaml`` 加载）。
 
     字段:
         mapping: Dict[str, str] —— 语义角色 -> 图谱关系名

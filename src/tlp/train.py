@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-src/tkgl/train.py
+src/tlp/train.py
 =====================================================================
-TKGL-Smallpedia 时序知识图谱链接预测 —— 训练
+TKGL-Smallpedia 时序链接预测 —— 训练
 
 包含：
   * _sample_typed_negatives : 同关系困难负采样（训练用）
@@ -10,8 +10,8 @@ TKGL-Smallpedia 时序知识图谱链接预测 —— 训练
   * run_training            : 训练主流程（加载数据 → 建模型 → 训练 → 评测 → 保存）
   * main                    : 命令行入口
 
-模型见 src/model/tkgl.py；数据集加载见 src/dataset/tkgl_dataset.py；
-过滤式评测 evaluate_filtered 见 src/tkgl/predict.py。
+模型见 src/model/tlp.py；数据集加载见 src/dataset/tlp_dataset.py；
+过滤式评测 evaluate_filtered 见 src/tlp/predict.py。
 """
 
 import os
@@ -24,19 +24,19 @@ import torch
 import torch.nn.functional as F
 
 # 项目根目录加入 sys.path，使以脚本方式运行本文件时 `import src.model...` /
-# `import src.dataset...` / `import src.tkgl...` 等包内绝对导入可解析
-# （`python -m src.tkgl.train` 时 cwd 已在 path 中，无需此步；但 `python
-#  src/tkgl/train.py` 直接运行时脚本目录才在 path，必须补上根目录）。
+# `import src.dataset...` / `import src.tlp...` 等包内绝对导入可解析
+# （`python -m src.tlp.train` 时 cwd 已在 path 中，无需此步；但 `python
+#  src/tlp/train.py` 直接运行时脚本目录才在 path，必须补上根目录）。
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from src.model.tkgl import TemporalKGModel, save_checkpoint  # noqa: E402
-from src.dataset.tkgl_dataset import load_tkgl_data, iter_train_batches  # noqa: E402
+from src.model.tlp import TemporalKGModel, save_checkpoint  # noqa: E402
+from src.dataset.tlp_dataset import load_tlp_data, iter_train_batches  # noqa: E402
 
 # 过滤式评测（训练期 val 监控用）；predict 模块本身只依赖 temporal_model，
 # 不会产生循环依赖。
-from src.tkgl.predict import evaluate_filtered, _build_relation_endpoints, _get_relation_tail_set  # noqa: E402
+from src.tlp.predict import evaluate_filtered, _build_relation_endpoints, _get_relation_tail_set  # noqa: E402
 
 
 # ====================================================================
@@ -209,7 +209,7 @@ def run_training(args, device):
     print(f"📂 加载数据集: {args.data_dir}")
     # build_train_arrays=False：跳过约 150 万条训练/静态四元组的整体驻留，
     # 训练边改为 iter_train_batches 流式分批产出（验证/测试四元组仍需驻留，体积小）。
-    data = load_tkgl_data(
+    data = load_tlp_data(
         args.data_dir,
         args.dynamic_edge_file, args.static_edge_file,
         build_train_arrays=False
@@ -267,7 +267,7 @@ def run_training(args, device):
 
 
 def _build_arg_parser():
-    parser = argparse.ArgumentParser(description="TKGL-Smallpedia 时序知识图谱链接预测（训练）")
+    parser = argparse.ArgumentParser(description="动态链接预测（训练）")
     parser.add_argument("--data-dir", type=str,
                         default=os.path.join(_ROOT, "data", "tkgl-smallpedia"))
     parser.add_argument("--dynamic-edge-file", type=str,

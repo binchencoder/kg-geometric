@@ -16,7 +16,7 @@ _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardi
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-from src.model import TGNOilTemperaturePredict  # noqa: E402
+from src.model import TGNModel  # noqa: E402
 from src.model.training import (  # noqa: E402
     train_joint_rgcn_tgn,
     train_tgn,
@@ -193,7 +193,7 @@ class RGCNFaultDiagnosis(torch.nn.Module):
         return logits, h2
 
 
-# ===================== 4. 模型2：TGN 时序趋势预测模型 =====================
+# ===================== 4. 模型2：TGN 时序属性预测模型 =====================
 # TGN 模型核心已抽取到 src/model/tgn.py，这里封装一个便捷工厂函数。
 
 
@@ -202,7 +202,7 @@ def build_tgn_oil_temperature_predict(hidden_dim, num_time_slices):
 
     配置与原脚本保持完全一致，包括节点输入维度、边类型与预测头结构。
     """
-    return TGNOilTemperaturePredict(
+    return TGNModel(
         in_channels={
             "transformer": 3,
             "time_slice": FEATURE_NUM,
@@ -284,7 +284,7 @@ def train_two_models(kg_graph, hold_out_n=5, model_dir="./trained_models"):
 
 # ===================== 6. 推理打印函数（完整输出推理链路） =====================
 def full_inference_print(kg_data, diag_model, tgn_model, slice_idx):
-    """对指定时序切片执行故障诊断+趋势预测，完整打印推理过程"""
+    """对指定时序切片执行故障诊断+属性预测，完整打印推理过程"""
     print("=" * 100)
     print(f"【变压器时序推理】切片ID：{slice_idx} | 时间：{kg_data['time_slice'].date_str[slice_idx]}")
     print("=" * 100)
@@ -329,7 +329,7 @@ def full_inference_print(kg_data, diag_model, tgn_model, slice_idx):
     for rule in rules:
         print(f"  {rule}")
 
-    # 4. TGN时序趋势预测（模型输出是 z-score，需反标准化成摄氏度）
+    # 4. TGN时序属性预测（模型输出是 z-score，需反标准化成摄氏度）
     with torch.no_grad():
         future_ot_pred, fault_risk_pred, _ = tgn_model(kg_data)
         ot_mean_val = kg_data["time_slice"].ot_mean.item()
@@ -339,7 +339,7 @@ def full_inference_print(kg_data, diag_model, tgn_model, slice_idx):
         pred_fault_risk = fault_risk_pred[slice_idx].item()
 
     risk_level = "低风险" if pred_fault_risk < 0.3 else ("中风险" if pred_fault_risk < 0.7 else "高风险")
-    print(f"\n[4] TGN时序图模型趋势预测结果：")
+    print(f"\n[4] TGN时序图模型属性预测结果：")
     print(
         f"  未来3步预测油温：{pred_future_ot:.4f}℃，真实油温：{true_future_ot:.4f}℃，误差：{abs(pred_future_ot - true_future_ot):.4f}℃")
     print(f"  未来故障发生概率：{pred_fault_risk:.2%}，风险等级：{risk_level}")
@@ -384,7 +384,7 @@ if __name__ == "__main__":
         print(f"加载故障诊断模型：{diag_path}")
         diag_model.load_state_dict(torch.load(diag_path, map_location=DEVICE, weights_only=True))
         diag_model.eval()
-        print(f"加载时序趋势预测模型：{tgn_path}")
+        print(f"加载时序属性预测模型：{tgn_path}")
         tgn_model.load_state_dict(torch.load(tgn_path, map_location=DEVICE, weights_only=True))
         tgn_model.eval()
         # 与训练时的切分逻辑保持一致：尾部最后 HOLD_OUT_N 个切片是"未知样本"

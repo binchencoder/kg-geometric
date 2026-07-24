@@ -5,7 +5,7 @@
 支持自动发现 models/ 目录下所有模型，并为每种模型动态构建推理流程。
 
 支持的模型类型：
-- kg_fault_model: 基于 FaultRGCN 的知识图谱故障诊断模型
+- kg_fault_model: 基于 FaultRGCN 的知识图谱静态链接预测模型
 
 使用方式：
     python predict.py
@@ -25,7 +25,7 @@ import torch
 
 from src.core.config import InferenceConfig, RelationMappingConfig
 from src.model.rgcn import FaultRGCN
-from src.pipeline.inference import DiagnosisResult, infer_from_text
+from src.pipeline.inference import SLPResult, infer_from_text
 
 if TYPE_CHECKING:
     from src.dataset.triple_dataset import KGTripleDataset
@@ -217,30 +217,31 @@ def _get_handler(model_name: str) -> Optional[ModelHandler]:
 
 
 # ============================================================
-# 3. 知识图谱故障诊断模型处理器
+# 3. 知识图谱静态链接预测模型处理器
 # ============================================================
 
 
-class DiagnosisModelHandler(ModelHandler):
-    """知识图谱故障诊断模型处理器（仅支持 FaultRGCN checkpoint）。
+class SLPModelHandler(ModelHandler):
+    """知识图谱静态链接预测模型处理器（仅支持 FaultRGCN checkpoint）。
 
     checkpoint 由 ``train.py`` 训练生成，已内嵌完整图结构（dataset /
     graph_data / node_to_idx / fault_nodes），推理时无需再连接 ES。
 
-    采用与 ``demo/fault_diagnosis.py`` 一致的四阶段推理：语义匹配 → 故障定位
-    → 答案生成 → 结果组装，除 Top-K 故障定位外，还输出每个故障的
-    可能原因（causes）、维修措施（actions）、所需工具（tools）。
+    采用与 ``infer_from_text`` 一致的通用推理流程：语义匹配 → 关系检索，
+    以查询文本匹配到的最佳头实体为中心，按 relation_mapping 中给定的每个
+    关系检索其正向相连的尾实体。
 
-    输入：换行分隔的症状文本（如 "振动过高\\n温度过高"）
-    输出：含故障定位与 causes/actions/tools 分析的 JSON
+    输入：查询文本（如实体名称片段，多个可用换行分隔）
+    输出：含最佳匹配实体与各关系尾实体的 JSON
     """
 
-    model_pattern = "diagnosis_model"
+    model_pattern = "slp_model"
 
     def __init__(
-            self, device: str = "cpu",
+            self,
+            device: str = "cpu",
             top_k: int = 3,
-            symptom_relation: str | None = None,
+            relation_mapping: Optional[Dict[str, str]] = None,
     ):
         """
         Parameters
@@ -248,14 +249,13 @@ class DiagnosisModelHandler(ModelHandler):
         device : str
             推理设备，支持 "cpu" / "cuda" / "cuda:0" 等。
         top_k : int
-            返回 Top-K 故障诊断结果。
-        symptom_relation : str | None
-            症状→故障的语义匹配关系名。为 None 时从 config.yaml 的
-            relation_mapping.symptoms 读取（默认 "表现为"）。
+            返回 Top-K 静态链接预测结果。
+        relation_mapping : Optional[Dict[str, str]]
+            输出字段名 → 关系名的映射。为 None 时使用数据集默认关系映射。
         """
         self.device = device
         self.top_k = top_k
-        self.symptom_relation = symptom_relation
+        self.relation_mapping = relation_mapping
         self.dataset: Optional["KGTripleDataset"] = None
         self.data: Optional[Any] = None
 
@@ -372,7 +372,7 @@ class DiagnosisModelHandler(ModelHandler):
     def preprocess(self, instance: str) -> str:
         """将输入文本解析为查询字符串。
 
-        支持换行分隔的多个症状（如 "振动过高\\n温度过高"），
+        支持换行分隔的多个实例（如 "振动过高\\n温度过高"），
         交由 ``infer_from_text`` 做字符级语义匹配。
 
         Parameters
@@ -401,23 +401,22 @@ class DiagnosisModelHandler(ModelHandler):
             self,
             model: Tuple[FaultRGCN, dict],
             processed_input: str,
-    ) -> Optional[DiagnosisResult]:
-        """基于症状文本执行四阶段故障诊断推理（含原因/措施/工具分析）。
+    ) -> Optional[SLPResult]:
+        """基于查询文本执行静态链接预测推理。
 
-        流程与 ``demo/fault_diagnosis.py`` 一致：语义匹配 → 故障定位 →
-        答案生成（causes/actions/tools）→ 结果组装。
+        流程与 ``infer_from_text`` 一致：语义匹配 → 关系检索。
 
         Parameters
         ----------
         model : Tuple[FaultRGCN, dict]
             (模型实例, 元信息)。
         processed_input : str
-            症状查询文本。
+            查询文本。
 
         Returns
         -------
-        Optional[DiagnosisResult]
-            完整诊断结果；未匹配到任何症状时返回 None。
+        Optional[SLPResult]
+            完整推理结果；未匹配到任何实体时返回 None。
         """
         rgcn_model, _ = model
 
@@ -429,9 +428,8 @@ class DiagnosisModelHandler(ModelHandler):
                 model=rgcn_model,
                 dataset=self.dataset,
                 query_text=processed_input,
-                symptom_relation=self.symptom_relation,
-                top_k_symptoms=5,
-                top_k_faults=self.top_k,
+                relation_mapping=self.relation_mapping,
+                top_k=self.top_k,
                 device=self.device,
             )
         except ValueError as e:
@@ -439,63 +437,49 @@ class DiagnosisModelHandler(ModelHandler):
             return None
 
         logger.info(
-            "推理完成: 最佳故障=%s, %d 原因, %d 措施, %d 工具",
-            result.best_fault,
-            len(result.causes), len(result.actions), len(result.tools),
+            "推理完成: 最佳匹配=%s, 检索到 %d 个关系",
+            result.best_match,
+            len(result.relations),
         )
         return result
 
-    def postprocess(self, raw_result: Optional[DiagnosisResult]) -> str:
-        """将诊断结果格式化为 JSON 字符串（含 causes/actions/tools）。
+    def postprocess(self, raw_result: Optional[SLPResult]) -> str:
+        """将推理结果格式化为 JSON 字符串（按关系分组）。
 
         Parameters
         ----------
-        raw_result : Optional[DiagnosisResult]
-            四阶段推理结果。
+        raw_result : Optional[SLPResult]
+            推理结果。
 
         Returns
         -------
         str
-            JSON 字符串，包含故障定位、可能原因、维修措施、所需工具等。
+            JSON 字符串，包含最佳匹配实体与各关系的尾实体列表。
         """
-        if raw_result is None or not raw_result.fault_candidates:
+        if raw_result is None or not raw_result.best_match:
             return json.dumps(
-                {"diagnosis": [], "message": "未找到匹配的故障诊断结果"},
+                {"matches": [], "message": "未找到匹配的静态链接预测结果"},
                 ensure_ascii=False,
             )
 
-        best_fault = raw_result.best_fault
-        best_score = raw_result.fault_candidates[0][1]
+        best_match = raw_result.best_match
+        best_score = (
+            raw_result.matched_nodes[0][1] if raw_result.matched_nodes else 0.0
+        )
 
-        diagnosis_list = []
-        for rank, (fault, score) in enumerate(raw_result.fault_candidates, 1):
-            diagnosis_list.append({
-                "rank": rank,
-                "fault": fault,
-                "confidence": convert_percent(score),
-                "score": round(float(score), 4),
-            })
+        relation_detail = [
+            {"rank": rank, "relation": relation, "tails": nodes}
+            for rank, (relation, nodes) in enumerate(raw_result.relations.items(), 1)
+        ]
 
         result = {
-            "diagnosis": diagnosis_list,
-            "top_fault": best_fault,
-            "top_confidence": convert_percent(float(best_score)),
-            "causes": raw_result.causes,
-            "actions": raw_result.actions,
-            "tools": raw_result.tools,
-            "system": raw_result.system,
-            "category": raw_result.category,
-            "alternative_faults": [
-                {
-                    "fault": alt["fault"],
-                    "confidence": convert_percent(alt["confidence"]),
-                    "score": round(float(alt["confidence"]), 4),
-                    "causes": alt.get("causes", []),
-                    "actions": alt.get("actions", []),
-                    "tools": alt.get("tools", []),
-                }
-                for alt in raw_result.alternative_faults
+            "matches": [
+                {"entity": best_match, "score": round(float(best_score), 4)}
             ],
+            "top_entity": best_match,
+            "top_score": round(float(best_score), 4),
+            "relations": raw_result.relations,
+            "relation_detail": relation_detail,
         }
         return json.dumps(result, ensure_ascii=False)
 
@@ -694,19 +678,19 @@ def _build_arg_parser(cfg: InferenceConfig) -> "argparse.ArgumentParser":
     )
     parser.add_argument(
         "--models-dir",
-        default=cfg.models_dir,
-        help=f"模型目录路径 (默认来自 config.yaml: {cfg.models_dir})",
+        default=cfg.slp_config.model_path,
+        help=f"模型目录路径 (默认来自 config.yaml: {cfg.slp_config.model_path})",
     )
     parser.add_argument(
         "--instance",
-        default=cfg.instance,
+        default=cfg.slp_config.instance,
         help="输入实例文本，多个症状以换行符分隔 (默认来自 config.yaml)",
     )
     parser.add_argument(
         "--top-k",
         type=int,
-        default=cfg.top_k,
-        help=f"返回 Top-K 故障诊断结果 (默认来自 config.yaml: {cfg.top_k})",
+        default=cfg.slp_config.top_k,
+        help=f"返回 Top-K 静态链接预测结果 (默认来自 config.yaml: {cfg.slp_config.top_k})",
     )
     parser.add_argument(
         "--device",
@@ -727,14 +711,13 @@ def main() -> None:
         args.device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # ---- 注册模型处理器 ----
-    # symptom_relation 不再通过参数传递，由处理器从 config.yaml 的
-    # relation_mapping.symptoms 读取。
+    # 关系映射由处理器从 config.yaml 的 relation_mapping 读取（默认全量映射）。
     register_handler(
-        "diagnosis_model",
-        DiagnosisModelHandler(
+        "slp_model",
+        SLPModelHandler(
             device=args.device,
             top_k=args.top_k,
-            symptom_relation=RelationMappingConfig.default().mapping.get("symptoms"),
+            relation_mapping=RelationMappingConfig.default().mapping,
         ),
     )
 
@@ -783,32 +766,18 @@ def main() -> None:
         if "error" in result:
             print(f"  ✗ 推理失败: {result['error']}")
         else:
-            print(f"  最佳匹配故障 : {result.get('top_fault', 'N/A')}")
-            print(f"  置信度       : {result.get('top_confidence', 'N/A')}")
-            causes = result.get("causes", [])
-            actions = result.get("actions", [])
-            tools = result.get("tools", [])
-            if causes:
-                print(f"  可能原因     : {'、'.join(causes)}")
-            if actions:
-                print(f"  维修措施     : {'、'.join(actions)}")
-            if tools:
-                print(f"  所需工具     : {'、'.join(tools)}")
-            print(f"  诊断详情     :")
-            for d in result.get("diagnosis", []):
-                bar = "█" * max(1, int(float(d.get("confidence", "0%").rstrip("%")) / 5))
-                print(f"    Top-{d['rank']}: {d['fault']:<12} {d['confidence']:>8} {bar}")
-            alts = result.get("alternative_faults", [])
-            if alts:
-                print(f"  备选故障     :")
-                for alt in alts:
-                    extra = []
-                    if alt.get("causes"):
-                        extra.append(f"原因: {'、'.join(alt['causes'][:3])}")
-                    if alt.get("actions"):
-                        extra.append(f"措施: {'、'.join(alt['actions'][:3])}")
-                    suffix = f" ({'；'.join(extra)})" if extra else ""
-                    print(f"    - {alt['fault']} ({alt['confidence']}){suffix}")
+            print(f"  最佳匹配实体 : {result.get('top_entity', 'N/A')}")
+            print(f"  相似度       : {result.get('top_score', 'N/A')}")
+            print(f"  关系结果     :")
+            for relation, nodes in result.get("relations", {}).items():
+                if nodes:
+                    print(f"    • {relation}: {'、'.join(nodes[:5])}")
+            detail = result.get("relation_detail", [])
+            if detail:
+                print(f"  关系详情     :")
+                for d in detail:
+                    print(f"    #{d['rank']} {d['relation']}: "
+                          f"{', '.join(d['tails'][:5])}")
         print(f"  耗时         : {elapsed:.3f}s")
 
     # ---- Phase 3: 全模型批量推理 ----

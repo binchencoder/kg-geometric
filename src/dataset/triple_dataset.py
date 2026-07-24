@@ -395,47 +395,29 @@ class KGTripleDataset:
                 fault_categories.add(triple.head)
         return sorted(fault_categories)
 
-    def get_fault_info(
+    def get_node_relations(
             self,
-            fault_node: str,
-            relation_mapping: Optional[Dict[str, str]] = None,
+            node: str,
+            relation_mapping: Dict[str, str],
     ) -> Dict[str, List[str]]:
-        """获取指定故障节点的完整诊断信息。
+        """以给定节点为中心，按关系映射检索其正向相连的尾实体。
 
         Parameters
         ----------
-        fault_node : str
-            故障类别节点名称，如 "发动机动力不足"。
-        relation_mapping : Optional[Dict[str, str]]
-            语义角色 → 实际关系名的映射。例如
-            {"causes": "由...引起", "actions": "维修措施"}。
-            不传则使用 ``self.default_relation_mapping``（来自 config.yaml）；
-            若映射在当前图谱中不存在，则按真实关系名分组返回。
+        node : str
+            中心节点名称。
+        relation_mapping : Dict[str, str]
+            输出字段名 → 关系名的映射。传入几个关系就输出几个关系的结果。
 
         Returns
         -------
         Dict[str, List[str]]
-            若使用默认/指定映射：
-                {"symptoms": [...], "causes": [...], "actions": [...],
-                 "tools": [...], "system": [...], "category": [...]}
-            若映射全部失效（ type-agnostic 模式）：
-                {relation_name: [tails], ...}
+            {关系名: [尾实体, ...]}，key 为 relation_mapping 中的实际关系名。
         """
-        mapping = relation_mapping if relation_mapping is not None \
-            else self.default_relation_mapping
-
         result: Dict[str, List[str]] = {}
-        for key, relation in mapping.items():
+        for key, relation in relation_mapping.items():
             if self.has_relation(relation):
-                result[key] = self.get_forward(fault_node, relation)
-
-        # 若映射中没有任何关系命中，退化为 type-agnostic：按真实关系名分组
-        if not result:
-            result = {
-                relation: self.get_forward(fault_node, relation)
-                for relation in self.relation_list
-                if self.get_forward(fault_node, relation)
-            }
+                result[key] = self.get_forward(node, relation)
 
         return result
 
@@ -466,7 +448,7 @@ class KGTripleDataset:
     # ================================================================
 
     def to_data(self):
-        """生成标准 PyG Data 对象（用于 FaultGCN 兼容）。"""
+        """生成标准 PyG Data 对象（用于 GCNModel 兼容）。"""
         from torch_geometric.data import Data
         return Data(x=self.x, edge_index=self.edge_index, y=self.y)
 

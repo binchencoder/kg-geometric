@@ -5,8 +5,8 @@ Elasticsearch 知识图谱数据读取与训练脚本。
 - src/core/  : ESConfig, Triple, BatchProgress, logger
 - src/es/    : ESKnowledgeGraphReader, IDNameResolver, ESTripletStreamer, KGVocabulary
 - src/graph/ : TripleToDatasetConverter, KGNeighborLoaderAdapter, AsyncSubgraphSampler
-- src/model/ : FaultGCN, FaultLabelBuilder, split_masks, train, evaluate
-- src/pipeline/: StreamingTrainingPipeline, KGTrainInferPipeline, topk_fault_diagnosis
+- src/model/ : GCNModel, FaultLabelBuilder, split_masks, train, evaluate
+- src/pipeline/: StreamingTrainingPipeline, KGTrainInferPipeline, topk_static_link_prediction
 
 用法:
     python es_kg_reader.py --mode streaming --index knowledge_entity_relation_index
@@ -27,9 +27,9 @@ from src import (
     # graph
     TripleToDatasetConverter, KGNeighborLoaderAdapter, AsyncSubgraphSampler,
     # model
-    FaultGCN, FaultLabelBuilder, split_masks, train, evaluate,
+    GCNModel, FaultLabelBuilder, split_masks, train, evaluate,
     # pipeline
-    StreamingTrainingPipeline, KGTrainInferPipeline, topk_fault_diagnosis,
+    StreamingTrainingPipeline, KGTrainInferPipeline, topk_static_link_prediction,
 )
 
 
@@ -112,7 +112,7 @@ def _run_legacy_mode(args) -> None:
         data = converter.to_data()
 
         data.train_mask, data.val_mask, data.test_mask = split_masks(data.num_nodes)
-        model = FaultGCN(in_dim=data.num_features, hidden_dim=32)
+        model = GCNModel(in_dim=data.num_features, hidden_dim=32)
         train(model, data)
         evaluate(model, data)
 
@@ -128,7 +128,7 @@ def _run_legacy_mode(args) -> None:
 
             logger.info("\n执行 Top-K 故障诊断推理 ...")
             try:
-                results = topk_fault_diagnosis(
+                results = topk_static_link_prediction(
                     model, data,
                     converter.node_to_idx,
                     converter.fault_nodes,

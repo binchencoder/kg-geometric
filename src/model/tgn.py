@@ -1,4 +1,4 @@
-"""TGN 模型 —— Temporal Graph Network 用于时序异构图趋势预测。
+"""TGN 模型 —— Temporal Graph Network 用于时序异构图属性预测。
 
 结合 PyG 的 TGNMemory（节点记忆）、TimeEncoder（余弦时序编码）
 与 HeteroConv（异构图卷积），实现在时序知识图谱上的因果消息传递，
@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import warnings
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -234,7 +235,15 @@ class TGN(nn.Module):
         # 3) 逐层异构图卷积，注意保留仅作为源节点的类型
         for conv in self.convs:
             prev = x_dict
-            x_dict = conv(x_dict, edge_index_dict)
+            # transformer 等仅作为源节点的类型不会在消息传递中被更新，这是预期
+            # 设计（其特征是静态输入，下游只使用 time_slice 的嵌入）；忽略 PyG 的
+            # "do not occur as destination type in any edge type" 良性 UserWarning。
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message=".*do not occur as destination type in any edge type.*",
+                )
+                x_dict = conv(x_dict, edge_index_dict)
             for k, v in prev.items():
                 if k not in x_dict:
                     x_dict[k] = v
@@ -245,7 +254,7 @@ class TGN(nn.Module):
         return out_dict
 
 
-class TGNOilTemperaturePredict(nn.Module):
+class TGNModel(nn.Module):
     """基于 TGN 的变压器油温预测与故障风险评分模型。
 
     包含两个预测头：

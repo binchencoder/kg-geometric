@@ -38,16 +38,28 @@ import torch
 from src.core.config import ESConfig, logger
 from src.core.types import Triple
 from src.dataset.link_prediction import LinkPredictionData, LinkPredictionStreamingData
-from src.model import (
-    LinkPredictionGCN,
-    train_link_prediction,
-    evaluate_link_prediction,
-    predict_top_k,
-    print_link_prediction_results,
-    train_link_prediction_streaming,
-    evaluate_link_prediction_streaming,
-    predict_top_k_streaming,
-)
+try:
+    from link_prediction import LinkPredictionGCN
+    from link_prediction_training import (
+        train_link_prediction,
+        evaluate_link_prediction,
+        predict_top_k,
+        print_link_prediction_results,
+        train_link_prediction_streaming,
+        evaluate_link_prediction_streaming,
+        predict_top_k_streaming,
+    )
+except ModuleNotFoundError:  # 从项目根目录 `python demo/link_prediction_demo.py`
+    from demo.link_prediction import LinkPredictionGCN
+    from demo.link_prediction_training import (
+        train_link_prediction,
+        evaluate_link_prediction,
+        predict_top_k,
+        print_link_prediction_results,
+        train_link_prediction_streaming,
+        evaluate_link_prediction_streaming,
+        predict_top_k_streaming,
+    )
 
 
 # -------------------- 命令行参数解析 --------------------

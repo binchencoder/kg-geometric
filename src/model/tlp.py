@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-src/model/tkgl.py
+src/model/tlp.py
 =====================================================================
-TKGL-Smallpedia 时序知识图谱链接预测 —— 模型与 checkpoint 序列化
+TKGL-Smallpedia 时序链接预测 —— 模型与 checkpoint 序列化
 
 模型：TGAT 风格时序图注意力编码器 + 时间感知 DistMult 解码器
       （「时间」作为关系的一个属性：rel_repr = rel_emb + TimeEncoder(τ)）
 
-本文件自包含，仅依赖 numpy / torch，可被 src/tkgl/train.py 与
-src/tkgl/predict.py 复用。原实现位于 demo/tkgl_smallpedia_tkg.py，
+本文件自包含，仅依赖 numpy / torch，可被 src/tlp/train.py 与
+src/tlp/predict.py 复用。原实现位于 demo/tkgl_smallpedia_tkg.py，
 此处抽取为独立模块。
 """
 
